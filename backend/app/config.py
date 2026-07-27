@@ -92,6 +92,17 @@ class Settings(BaseSettings):
         default="",
         description="Episodic memory PostgreSQL URL (empty for in-memory)",
     )
+
+    # RAG / Knowledge Base
+    rag_enabled: bool = Field(default=True, description="Enable RAG knowledge system")
+    rag_collection_name: str = Field(default="knowledge_base", description="RAG knowledge base collection name")
+    rag_embedding_model: str = Field(default="text-embedding-ada-002", description="Embedding model name")
+    rag_embedding_dimension: int = Field(default=1536, description="Embedding vector dimension")
+    rag_chunk_size: int = Field(default=1000, description="Text chunk size in characters")
+    rag_chunk_overlap: int = Field(default=200, description="Overlap between chunks in characters")
+    rag_context_limit: int = Field(default=5, description="Default max context chunks retrieved")
+    rag_min_score: float = Field(default=0.3, description="Minimum similarity score for retrieval")
+    rag_document_storage_path: str = Field(default="./data/documents", description="Path for ingested documents")
     
     @field_validator("environment")
     @classmethod

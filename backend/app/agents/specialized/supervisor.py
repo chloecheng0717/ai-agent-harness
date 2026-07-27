@@ -30,6 +30,7 @@ from app.models.memory import EpisodicMemoryEntry, MemoryType
 
 if TYPE_CHECKING:
     from app.memory.manager import MemoryManager
+    from app.rag.pipeline import RAGPipeline
 
 
 class SupervisorAgent(BaseAgent):
@@ -50,6 +51,7 @@ class SupervisorAgent(BaseAgent):
         config: Optional[AgentConfig] = None,
         registry: Optional["AgentRegistry"] = None,
         memory_manager: Optional["MemoryManager"] = None,
+        rag_pipeline: Optional["RAGPipeline"] = None,
     ) -> None:
         if config is None:
             config = AgentConfig(
@@ -60,6 +62,7 @@ class SupervisorAgent(BaseAgent):
         super().__init__(config)
         self.logger = self.logger.bind(component="supervisor_agent")
         self.memory_manager = memory_manager
+        self.rag_pipeline = rag_pipeline
 
         # Lazy import to avoid circular dependency at module level
         if registry is None:
@@ -125,6 +128,15 @@ class SupervisorAgent(BaseAgent):
             if self.memory_manager:
                 past_context = await self._retrieve_past_context(task, agent_keys)
 
+            # 0b. Retrieve relevant knowledge base context
+            kb_context = ""
+            if self.rag_pipeline:
+                kb_context = await self._retrieve_knowledge_context(task)
+
+            combined_context = "\n\n".join(
+                filter(None, [context, past_context, kb_context])
+            )
+
             # 1. Analyse and decide which agents are needed
             selected_agents = self._select_agents(task, agent_keys)
             self.logger.info(
@@ -148,7 +160,9 @@ class SupervisorAgent(BaseAgent):
                 )
                 messages.append(msg)
 
-                result = await self._dispatch_to_agent(agent_key, agent_cls, task, context)
+                result = await self._dispatch_to_agent(
+                    agent_key, agent_cls, task, combined_context,
+                )
                 agent_results[agent_key] = result
 
                 if result.get("success"):
@@ -363,6 +377,19 @@ class SupervisorAgent(BaseAgent):
             parts.append("")
 
         return "\n".join(parts)
+
+    # ── Knowledge base helpers ─────────────────────────────────
+
+    async def _retrieve_knowledge_context(self, task: str) -> str:
+        """Retrieve relevant knowledge base context for the task."""
+        if not self.rag_pipeline:
+            return ""
+        try:
+            result = await self.rag_pipeline.retrieve(task)
+            return result.get("context_text", "")
+        except Exception as exc:
+            self.logger.warning("Knowledge base retrieval failed", error=str(exc))
+            return ""
 
     # ── Memory helpers ─────────────────────────────────────────
 

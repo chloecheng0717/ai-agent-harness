@@ -5,6 +5,7 @@ This package contains memory system implementations:
 - Short-term: Conversation history (in-memory sliding window, optional Redis)
 - Long-term: Knowledge base (ChromaDB vector DB with in-memory fallback)
 - Episodic: Task experiences (PostgreSQL with in-memory fallback)
+- RAG: Retrieval-Augmented Generation knowledge system
 
 MemoryManager provides a unified facade used by all agents.
 """

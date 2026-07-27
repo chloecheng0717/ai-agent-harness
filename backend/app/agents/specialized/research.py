@@ -13,12 +13,15 @@ Responsibilities
 * Knowledge analysis — identifying patterns, key facts, and gaps.
 """
 
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import structlog
 
 from app.agents.base import AgentConfig, BaseAgent
 from app.models.agent import AgentStatus, AgentType
+
+if TYPE_CHECKING:
+    from app.rag.pipeline import RAGPipeline
 
 
 class ResearchAgent(BaseAgent):
@@ -29,9 +32,15 @@ class ResearchAgent(BaseAgent):
     ----------
     config : AgentConfig | None
         Agent configuration.  ``type`` defaults to ``RESEARCHER``.
+    rag_pipeline : RAGPipeline | None
+        Optional RAG pipeline for knowledge-base retrieval.
     """
 
-    def __init__(self, config: Optional[AgentConfig] = None) -> None:
+    def __init__(
+        self,
+        config: Optional[AgentConfig] = None,
+        rag_pipeline: Optional["RAGPipeline"] = None,
+    ) -> None:
         if config is None:
             config = AgentConfig(
                 name="ResearchAgent",
@@ -40,6 +49,7 @@ class ResearchAgent(BaseAgent):
             )
         super().__init__(config)
         self.logger = self.logger.bind(component="research_agent")
+        self.rag_pipeline = rag_pipeline
 
     # ── BaseAgent interface ───────────────────────────────────
 
@@ -77,7 +87,20 @@ class ResearchAgent(BaseAgent):
         findings: List[Dict[str, Any]] = []
 
         try:
+            kb_context = ""
+            if self.rag_pipeline:
+                kb_context = await self._retrieve_knowledge(task)
+
             findings = self._gather_findings(task, context, sources)
+            if kb_context:
+                findings.insert(0, {
+                    "id": 0,
+                    "category": "knowledge_base",
+                    "title": "Retrieved from Knowledge Base",
+                    "content": kb_context,
+                    "confidence": 0.85,
+                    "source": "knowledge_base",
+                })
             summary = self._summarise(task, findings)
 
             self.update_memory("last_task", task)
@@ -135,6 +158,17 @@ class ResearchAgent(BaseAgent):
         return insights
 
     # ── Internal helpers ──────────────────────────────────────
+
+    async def _retrieve_knowledge(self, task: str) -> str:
+        """Retrieve relevant context from the knowledge base."""
+        if not self.rag_pipeline:
+            return ""
+        try:
+            result = await self.rag_pipeline.retrieve(task)
+            return result.get("context_text", "")
+        except Exception as exc:
+            self.logger.warning("Knowledge base retrieval failed", error=str(exc))
+            return ""
 
     @staticmethod
     def _gather_findings(

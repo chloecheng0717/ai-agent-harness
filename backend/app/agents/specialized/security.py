@@ -12,12 +12,15 @@ Responsibilities
 * Risk assessment with severity classification.
 """
 
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import structlog
 
 from app.agents.base import AgentConfig, BaseAgent
 from app.models.agent import AgentStatus, AgentType
+
+if TYPE_CHECKING:
+    from app.rag.pipeline import RAGPipeline
 
 
 class SecurityAgent(BaseAgent):
@@ -29,9 +32,15 @@ class SecurityAgent(BaseAgent):
     ----------
     config : AgentConfig | None
         Agent configuration.  ``type`` defaults to ``SECURITY``.
+    rag_pipeline : RAGPipeline | None
+        Optional RAG pipeline for security knowledge retrieval.
     """
 
-    def __init__(self, config: Optional[AgentConfig] = None) -> None:
+    def __init__(
+        self,
+        config: Optional[AgentConfig] = None,
+        rag_pipeline: Optional["RAGPipeline"] = None,
+    ) -> None:
         if config is None:
             config = AgentConfig(
                 name="SecurityAgent",
@@ -40,6 +49,7 @@ class SecurityAgent(BaseAgent):
             )
         super().__init__(config)
         self.logger = self.logger.bind(component="security_agent")
+        self.rag_pipeline = rag_pipeline
 
     # ── BaseAgent interface ───────────────────────────────────
 
@@ -83,7 +93,20 @@ class SecurityAgent(BaseAgent):
         risk_level: str = "low"
 
         try:
+            kb_context = ""
+            if self.rag_pipeline:
+                kb_context = await self._retrieve_security_knowledge(task, target)
+
             vulnerabilities = self._analyse_vulnerabilities(task, target, context, scan_type)
+            if kb_context:
+                vulnerabilities.insert(0, {
+                    "id": "VULN-KB",
+                    "title": "Knowledge Base Context",
+                    "description": kb_context,
+                    "severity": "info",
+                    "category": "knowledge_base",
+                    "target": target,
+                })
             recommendations = self._generate_recommendations(vulnerabilities, scan_type)
             risk_level = self._assess_risk_level(vulnerabilities)
 
@@ -146,6 +169,18 @@ class SecurityAgent(BaseAgent):
         return insights
 
     # ── Internal helpers ──────────────────────────────────────
+
+    async def _retrieve_security_knowledge(self, task: str, target: str) -> str:
+        """Retrieve relevant security knowledge from the knowledge base."""
+        if not self.rag_pipeline:
+            return ""
+        try:
+            query = f"{task} {target}".strip() if target else task
+            result = await self.rag_pipeline.retrieve(query)
+            return result.get("context_text", "")
+        except Exception as exc:
+            self.logger.warning("Security knowledge retrieval failed", error=str(exc))
+            return ""
 
     @staticmethod
     def _analyse_vulnerabilities(
