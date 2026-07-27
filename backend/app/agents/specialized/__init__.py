@@ -10,7 +10,9 @@ This package contains specialized agent implementations:
 """
 
 from app.agents.specialized.planner import PlannerAgent
+from app.agents.specialized.executor import ExecutorAgent
 
 __all__ = [
     "PlannerAgent",
+    "ExecutorAgent",
 ]

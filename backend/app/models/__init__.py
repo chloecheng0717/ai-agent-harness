@@ -43,6 +43,12 @@ from app.models.llm import (
 )
 from app.models.providers import OpenAIProvider
 
+from app.models.execution import (
+    ExecutionResult,
+    ExecutionRecord,
+    ExecutionStatus,
+)
+
 __all__ = [
     # Task models
     "TaskCreate",
@@ -80,6 +86,11 @@ __all__ = [
     "TokenUsage",
     "Message",
     "PlanStep",
+
+    # Execution models
+    "ExecutionResult",
+    "ExecutionRecord",
+    "ExecutionStatus",
 
     # LLM models
     "BaseLLMProvider",
