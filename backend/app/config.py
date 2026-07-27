@@ -84,6 +84,15 @@ class Settings(BaseSettings):
     log_level: str = Field(default="INFO", description="Logging level")
     log_format: str = Field(default="json", description="Logging format (json or text)")
     
+    # Memory
+    memory_enabled: bool = Field(default=True, description="Enable memory system")
+    memory_short_term_max_size: int = Field(default=100, description="Short-term memory max entries")
+    memory_long_term_collection: str = Field(default="ai_agent_harness", description="Long-term memory collection name")
+    memory_episodic_database_url: str = Field(
+        default="",
+        description="Episodic memory PostgreSQL URL (empty for in-memory)",
+    )
+    
     @field_validator("environment")
     @classmethod
     def validate_environment(cls, v: str) -> str:

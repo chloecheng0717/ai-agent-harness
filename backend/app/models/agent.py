@@ -35,8 +35,11 @@ class AgentType(str, Enum):
     PLANNER = "planner"
     EXECUTOR = "executor"
     RESEARCHER = "researcher"
+    CODER = "coder"
     SECURITY = "security"
+    QA = "qa"
     REVIEWER = "reviewer"
+    SUPERVISOR = "supervisor"
     ORCHESTRATOR = "orchestrator"
 
 

@@ -39,6 +39,7 @@ from app.models.tool import ToolExecutionRequest, ToolPermission
 if TYPE_CHECKING:
     from app.agents.specialized.planner import PlannerAgent
     from app.tools.registry import ToolRegistry
+    from app.memory.manager import MemoryManager
 
 
 # ── retry decorator ─────────────────────────────────────────────
@@ -88,6 +89,7 @@ class Orchestrator:
         llm_provider: Optional[BaseLLMProvider] = None,
         planner: Optional["PlannerAgent"] = None,
         tool_registry: Optional["ToolRegistry"] = None,
+        memory_manager: Optional["MemoryManager"] = None,
     ) -> None:
         self.settings = get_settings()
         self.logger = structlog.get_logger().bind(component="orchestrator")
@@ -95,6 +97,7 @@ class Orchestrator:
         self.llm_provider = llm_provider
         self.planner = planner
         self.tool_registry = tool_registry
+        self.memory_manager = memory_manager
         self._max_replan_attempts: int = 2
 
         # Step registry — maps lifecycle steps to handler methods.
@@ -115,6 +118,7 @@ class Orchestrator:
             has_llm_provider=llm_provider is not None,
             has_planner=planner is not None,
             has_tool_registry=tool_registry is not None,
+            has_memory_manager=memory_manager is not None,
         )
 
     # ── LLM helpers ──────────────────────────────────────────
@@ -800,6 +804,28 @@ class Orchestrator:
                 self.logger.warning("LLM reflect failed, logging summary only")
 
         self.logger.info("Reflection summary", **summary)
+
+        # Store reflection in long-term memory
+        if self.memory_manager:
+            try:
+                from app.models.memory import MemoryType
+                reflection_text = (
+                    f"Reflection for goal '{state.goal}': "
+                    f"executed {len(state.results)} steps, "
+                    f"used {', '.join(set(state.tools_used)) or 'no'} tools, "
+                    f"{len(state.errors)} errors."
+                )
+                await self.memory_manager.store_memory(
+                    content=reflection_text,
+                    memory_type=MemoryType.LONG_TERM,
+                    task_id=state.task_id,
+                    metadata={"reflection": summary},
+                )
+            except Exception as exc:
+                self.logger.warning(
+                    "Failed to store reflection", error=str(exc)
+                )
+
         return state
 
     async def respond(self, state: AgentState) -> AgentState:
@@ -847,6 +873,22 @@ class Orchestrator:
             state.final_answer = self._fallback_answer(state)
 
         state.status = StepStatus.COMPLETED
+
+        # Store final answer in short-term memory
+        if self.memory_manager and state.final_answer:
+            try:
+                from app.models.memory import MemoryType
+                await self.memory_manager.store_memory(
+                    content=state.final_answer,
+                    memory_type=MemoryType.SHORT_TERM,
+                    task_id=state.task_id,
+                    metadata={"goal": state.goal},
+                )
+            except Exception as exc:
+                self.logger.warning(
+                    "Failed to store final answer", error=str(exc)
+                )
+
         return state
 
     @staticmethod

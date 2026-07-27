@@ -7,7 +7,7 @@ Models define the data structures used throughout the application.
 
 from app.models.task import TaskCreate, TaskResponse, TaskUpdate, TaskStatus, TaskPriority
 from app.models.agent import AgentCreate, AgentResponse, AgentUpdate, AgentStatus, AgentType
-from app.models.memory import MemoryEntry, MemorySearchResult
+from app.models.memory import MemoryEntry, MemorySearchResult, EpisodicMemoryEntry, MemoryType
 from app.models.tool import (
     ToolDefinition,
     ToolResult,
@@ -67,6 +67,8 @@ __all__ = [
     # Memory models
     "MemoryEntry",
     "MemorySearchResult",
+    "EpisodicMemoryEntry",
+    "MemoryType",
     
     # Tool models
     "ToolDefinition",

@@ -30,6 +30,7 @@ from app.models.tool import ToolExecutionRequest, ToolPermission
 
 if TYPE_CHECKING:
     from app.tools.registry import ToolRegistry
+    from app.memory.manager import MemoryManager
 
 
 # ── Constants ────────────────────────────────────────────────────
@@ -85,6 +86,7 @@ class ExecutorAgent(BaseAgent):
         tool_registry: Optional["ToolRegistry"] = None,
         max_retries: int = DEFAULT_MAX_RETRIES,
         default_timeout: int = DEFAULT_STEP_TIMEOUT,
+        memory_manager: Optional["MemoryManager"] = None,
     ) -> None:
         if config is None:
             config = AgentConfig(
@@ -97,6 +99,7 @@ class ExecutorAgent(BaseAgent):
         self.max_retries = max_retries
         self.default_timeout = default_timeout
         self.execution_history: List[ExecutionRecord] = []
+        self.memory_manager = memory_manager
         self.logger = self.logger.bind(component="executor_agent")
 
     # ── BaseAgent interface ───────────────────────────────────
@@ -153,6 +156,12 @@ class ExecutorAgent(BaseAgent):
         state.tools_used.extend(tools_used)
 
         self.execution_history.extend(records)
+
+        # Store execution results in memory
+        if self.memory_manager:
+            await self._store_execution_results(
+                state, results, errors, tools_used, success
+            )
 
         self.update_memory("last_results", [r.model_dump() for r in results])
         self.update_memory("last_errors", errors)
@@ -569,6 +578,53 @@ class ExecutorAgent(BaseAgent):
         )
 
     # ── Helpers ───────────────────────────────────────────────
+
+    async def _store_execution_results(
+        self,
+        state: AgentState,
+        results: List[ExecutionResult],
+        errors: List[str],
+        tools_used: List[str],
+        success: bool,
+    ) -> None:
+        """Store execution results in short-term and long-term memory."""
+        if not self.memory_manager:
+            return
+
+        try:
+            from app.models.memory import MemoryType
+
+            result_summary = (
+                f"Executed {len(results)} steps for goal: {state.goal}"
+            )
+            await self.memory_manager.store_memory(
+                content=result_summary,
+                memory_type=MemoryType.SHORT_TERM,
+                task_id=state.task_id,
+                metadata={
+                    "success": success,
+                    "step_count": len(results),
+                    "tools_used": tools_used,
+                    "error_count": len(errors),
+                },
+            )
+
+            if success:
+                knowledge = (
+                    f"Successful execution pattern for: {state.goal}. "
+                    f"Tools used: {', '.join(tools_used) or 'none'}. "
+                    f"Steps: {len(results)}."
+                )
+                await self.memory_manager.store_memory(
+                    content=knowledge,
+                    memory_type=MemoryType.LONG_TERM,
+                    task_id=state.task_id,
+                    metadata={"pattern_type": "execution_success"},
+                )
+        except Exception as exc:
+            self.logger.warning(
+                "Failed to store execution results", error=str(exc)
+            )
 
     @staticmethod
     async def _async_sleep(seconds: float) -> None:

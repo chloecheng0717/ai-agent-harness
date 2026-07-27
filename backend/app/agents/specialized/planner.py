@@ -14,7 +14,7 @@ Responsibilities
 """
 
 import json
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import structlog
 
@@ -27,6 +27,9 @@ from app.models.llm import (
     LLMProviderError,
 )
 from app.models.state import AgentState, PlanStep
+
+if TYPE_CHECKING:
+    from app.memory.manager import MemoryManager
 
 
 # ── Constants ────────────────────────────────────────────────────
@@ -100,6 +103,7 @@ class PlannerAgent(BaseAgent):
         config: Optional[AgentConfig] = None,
         llm_provider: Optional[BaseLLMProvider] = None,
         max_plan_steps: int = MAX_PLAN_STEPS,
+        memory_manager: Optional["MemoryManager"] = None,
     ) -> None:
         if config is None:
             config = AgentConfig(
@@ -110,6 +114,7 @@ class PlannerAgent(BaseAgent):
         super().__init__(config)
         self.llm_provider = llm_provider
         self.max_plan_steps = max_plan_steps
+        self.memory_manager = memory_manager
         self.logger = self.logger.bind(component="planner_agent")
 
     # ── BaseAgent interface ───────────────────────────────────
@@ -148,8 +153,12 @@ class PlannerAgent(BaseAgent):
             self.logger.info("Revising existing plan", goal=goal, error_count=len(errors))
             steps = await self.revise_plan(previous_plan, errors, feedback)
         else:
+            # Enrich context with previous plans from memory
+            enriched_context = context
+            if self.memory_manager:
+                enriched_context = await self._enrich_with_memory(goal, context)
             self.logger.info("Generating new plan", goal=goal)
-            steps = await self._plan_from_llm(goal, tools_available, context)
+            steps = await self._plan_from_llm(goal, tools_available, enriched_context)
 
         # Validate
         validation_errors = self.validate_plan(steps)
@@ -212,6 +221,34 @@ class PlannerAgent(BaseAgent):
         return insights
 
     # ── LLM-based planning ────────────────────────────────────
+
+    async def _enrich_with_memory(self, goal: str, context: str) -> str:
+        """
+        Retrieve similar past plans from episodic memory and append
+        them to the context so the LLM can learn from prior experience.
+        """
+        if not self.memory_manager:
+            return context
+
+        try:
+            from app.models.memory import MemoryType
+            results = await self.memory_manager.search_memory(
+                query=goal,
+                memory_type=MemoryType.EPISODIC,
+                limit=2,
+                min_score=0.3,
+            )
+            if not results:
+                return context
+
+            parts = [context] if context else []
+            parts.append("Previous similar tasks and their outcomes:")
+            for r in results:
+                parts.append(f"- {r.memory.content} (score: {r.score:.2f})")
+            return "\n".join(parts)
+        except Exception as exc:
+            self.logger.warning("Failed to enrich with memory", error=str(exc))
+            return context
 
     async def _plan_from_llm(
         self,

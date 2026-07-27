@@ -130,3 +130,61 @@ class MemorySearchQuery(BaseModel):
         le=1,
         description="Minimum relevance score"
     )
+
+
+class EpisodicMemoryEntry(BaseModel):
+    """
+    Episodic memory entry for storing task experiences.
+
+    Records full context of a completed task: what was attempted,
+    which agents participated, what tools were used, outcomes, and
+    an evaluation score for future reference.
+
+    Attributes:
+        id: Unique episode identifier.
+        task_description: The original task or goal.
+        agents_involved: Agent names that participated.
+        tools_used: Tool names that were invoked.
+        result_summary: Concise summary of the outcome.
+        errors: Errors encountered during execution.
+        evaluation_score: Quality score 0.0–1.0 (1 = perfect).
+        metadata: Arbitrary additional data.
+        agent_id: ID of the agent that recorded this episode.
+        created_at: When the episode was recorded.
+    """
+    id: UUID = Field(default_factory=uuid4, description="Unique episode identifier")
+    task_description: str = Field(..., description="Original task description")
+    agents_involved: List[str] = Field(
+        default_factory=list,
+        description="Agent names that participated",
+    )
+    tools_used: List[str] = Field(
+        default_factory=list,
+        description="Tool names invoked during the task",
+    )
+    result_summary: str = Field(
+        default="",
+        description="Concise summary of the outcome",
+    )
+    errors: List[str] = Field(
+        default_factory=list,
+        description="Errors encountered during execution",
+    )
+    evaluation_score: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=1.0,
+        description="Quality score from 0 (worst) to 1 (best)",
+    )
+    metadata: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Arbitrary additional data",
+    )
+    agent_id: Optional[UUID] = Field(
+        default=None,
+        description="ID of the agent that recorded this episode",
+    )
+    created_at: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc),
+        description="When the episode was recorded",
+    )
