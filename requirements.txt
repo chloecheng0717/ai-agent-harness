@@ -1,0 +1,5 @@
+# Main Requirements
+-r backend/requirements/base.txt
+
+# Development Requirements
+-r backend/requirements/dev.txt

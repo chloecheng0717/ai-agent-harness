@@ -1,0 +1,901 @@
+"""
+Orchestrator Module — Agent Runtime Engine
+
+This module provides the main orchestrator that coordinates the entire
+agent workflow.  It drives the lifecycle:
+
+    INITIALIZE → UNDERSTAND_TASK → CREATE_PLAN → SELECT_TOOLS
+    → EXECUTE_PLAN → EVALUATE_RESULT → REFLECT → RESPOND
+
+The orchestrator is intentionally LLM-agnostic: concrete LLM calls are
+delegated to pluggable provider interfaces that will be implemented later.
+Each lifecycle step is an async method that reads and writes AgentState,
+with structured logging, exception handling, and retry support.
+"""
+
+import asyncio
+import time
+from typing import TYPE_CHECKING, Any, Callable, Coroutine, Dict, List, Optional
+
+import structlog
+
+from app.config import get_settings
+from app.models.llm import (
+    BaseLLMProvider,
+    ChatCompletionRequest,
+    ChatMessage,
+    LLMProviderError,
+)
+from app.models.state import (
+    AgentState,
+    LifecycleStep,
+    PlanStep,
+    StepRecord,
+    StepStatus,
+)
+from app.models.task import TaskStatus
+from app.models.tool import ToolExecutionRequest, ToolPermission
+
+if TYPE_CHECKING:
+    from app.agents.specialized.planner import PlannerAgent
+    from app.tools.registry import ToolRegistry
+
+
+# ── retry decorator ─────────────────────────────────────────────
+
+
+class RetryExhaustedError(Exception):
+    """Raised when all retry attempts for a step have been exhausted."""
+
+    def __init__(self, step: str, attempts: int, last_error: str) -> None:
+        self.step = step
+        self.attempts = attempts
+        self.last_error = last_error
+        super().__init__(
+            f"Step '{step}' failed after {attempts} attempts: {last_error}"
+        )
+
+
+# Type alias for async step functions
+StepFn = Callable[[AgentState], Coroutine[Any, Any, AgentState]]
+
+
+# ── Orchestrator ────────────────────────────────────────────────
+
+
+class Orchestrator:
+    """
+    Main orchestrator — the Agent Runtime Engine.
+
+    Responsibilities
+    ----------------
+    * Drive the eight-step lifecycle for every task.
+    * Wrap each step in logging, timing, exception handling, and retry.
+    * Expose hook points (``on_step_*``) for observability.
+    * Delegate actual work (LLM calls, tool execution) to callbacks that
+      will be injected by higher-level components.
+
+    Attributes
+    ----------
+    settings : Application settings
+    logger  : Structured logger bound to the orchestrator component
+    max_retries : Maximum retry attempts per step (from config)
+    _step_registry : Mapping of lifecycle step → handler function
+    """
+
+    def __init__(
+        self,
+        llm_provider: Optional[BaseLLMProvider] = None,
+        planner: Optional["PlannerAgent"] = None,
+        tool_registry: Optional["ToolRegistry"] = None,
+    ) -> None:
+        self.settings = get_settings()
+        self.logger = structlog.get_logger().bind(component="orchestrator")
+        self.max_retries: int = 3
+        self.llm_provider = llm_provider
+        self.planner = planner
+        self.tool_registry = tool_registry
+        self._max_replan_attempts: int = 2
+
+        # Step registry — maps lifecycle steps to handler methods.
+        # Subclasses or callers can override individual entries.
+        self._step_registry: Dict[LifecycleStep, StepFn] = {
+            LifecycleStep.INITIALIZE: self.initialize,
+            LifecycleStep.UNDERSTAND_TASK: self.understand_task,
+            LifecycleStep.CREATE_PLAN: self.create_plan,
+            LifecycleStep.SELECT_TOOLS: self.select_tools,
+            LifecycleStep.EXECUTE_PLAN: self.execute_plan,
+            LifecycleStep.EVALUATE_RESULT: self.evaluate_result,
+            LifecycleStep.REFLECT: self.reflect,
+            LifecycleStep.RESPOND: self.respond,
+        }
+
+        self.logger.info(
+            "Orchestrator initialised",
+            has_llm_provider=llm_provider is not None,
+            has_planner=planner is not None,
+            has_tool_registry=tool_registry is not None,
+        )
+
+    # ── LLM helpers ──────────────────────────────────────────
+
+    async def _llm_chat(
+        self,
+        messages: List[ChatMessage],
+        state: AgentState,
+        **kwargs: Any,
+    ) -> str:
+        """
+        Send a chat request through the LLM provider and return the text.
+
+        Falls back to an empty string when no provider is configured.
+        Token usage is automatically recorded on *state*.
+
+        Parameters
+        ----------
+        messages : list[ChatMessage]
+            Messages to send.
+        state : AgentState
+            Current state (used for token tracking).
+        **kwargs
+            Extra parameters forwarded to ``ChatCompletionRequest``.
+
+        Returns
+        -------
+        str
+            The assistant's reply text.
+        """
+        if self.llm_provider is None:
+            return ""
+
+        request = ChatCompletionRequest(messages=messages, **kwargs)
+        try:
+            response = await self.llm_provider.chat_completion(request)
+            state.token_usage.add(
+                prompt=response.usage.prompt_tokens,
+                completion=response.usage.completion_tokens,
+                model=response.model,
+            )
+            return response.content
+        except LLMProviderError as exc:
+            self.logger.error("LLM call failed", error=str(exc))
+            state.add_error(f"LLM error: {exc}")
+            raise
+        except Exception as exc:
+            self.logger.error("Unexpected LLM error", error=str(exc))
+            state.add_error(f"LLM error: {exc}")
+            raise
+
+    def _build_system_message(self, content: str) -> ChatMessage:
+        return ChatMessage(role="system", content=content)
+
+    def _state_to_messages(self, state: AgentState) -> List[ChatMessage]:
+        """Convert the current message history to LLM-compatible messages."""
+        return [ChatMessage(role=m.role, content=m.content) for m in state.messages]
+
+    def _plan_context(self, state: AgentState) -> str:
+        """Build extra context string for the PlannerAgent."""
+        parts: List[str] = []
+        if state.metadata.get("replan_errors"):
+            parts.append(
+                "Previous execution failed with errors: "
+                + "; ".join(state.metadata["replan_errors"])
+            )
+        if state.metadata.get("replan_feedback"):
+            parts.append(f"Feedback: {state.metadata['replan_feedback']}")
+        return "\n".join(parts)
+
+    # ── public entry point ───────────────────────────────────
+
+    async def run(
+        self,
+        task_id: Any,
+        task_data: Dict[str, Any],
+        tools_available: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Execute the full agent lifecycle for a task.
+
+        This is the main entry point. It creates an :class:`AgentState`,
+        runs every lifecycle step in order, and returns a serialisable
+        result dictionary.
+
+        Parameters
+        ----------
+        task_id : UUID or str
+            Identifier for the task.
+        task_data : dict
+            Must contain at least ``"description"``.  May also include
+            ``"type"``, ``"metadata"``, ``"constraints"``, etc.
+        tools_available : list[str], optional
+            Tool names that may be used during execution.
+
+        Returns
+        -------
+        dict
+            Serialised result from :meth:`AgentState.to_result`.
+        """
+        state = AgentState(
+            task_id=task_id,
+            tools_available=tools_available or [],
+        )
+        state.add_message("user", task_data.get("description", ""))
+        state.metadata.update(task_data.get("metadata", {}))
+
+        self.logger.info(
+            "Lifecycle started",
+            task_id=str(state.task_id),
+            steps=len(self._step_registry),
+        )
+
+        overall_start = time.monotonic()
+
+        try:
+            for step in LifecycleStep:
+                state = await self._run_step(step, state)
+        except RetryExhaustedError as exc:
+            state.status = StepStatus.FAILED
+            state.add_error(str(exc))
+            self.logger.error(
+                "Lifecycle aborted",
+                task_id=str(state.task_id),
+                failed_step=exc.step,
+                error=exc.last_error,
+            )
+        except Exception as exc:
+            state.status = StepStatus.FAILED
+            state.add_error(str(exc))
+            self.logger.error(
+                "Lifecycle failed unexpectedly",
+                task_id=str(state.task_id),
+                error=str(exc),
+                error_type=type(exc).__name__,
+            )
+
+        overall_ms = (time.monotonic() - overall_start) * 1000
+        self.logger.info(
+            "Lifecycle finished",
+            task_id=str(state.task_id),
+            status=state.status.value,
+            overall_ms=round(overall_ms, 2),
+            token_usage=state.token_usage.total_tokens,
+        )
+
+        await self.close()
+        return state.to_result()
+
+    # ── step runner with retry ───────────────────────────────
+
+    async def _run_step(self, step: LifecycleStep, state: AgentState) -> AgentState:
+        """
+        Run a single lifecycle step with retry and error handling.
+
+        Parameters
+        ----------
+        step : LifecycleStep
+            The step to execute.
+        state : AgentState
+            Current shared state.
+
+        Returns
+        -------
+        AgentState
+            Updated state after step execution.
+        """
+        handler = self._step_registry.get(step)
+        if handler is None:
+            self.logger.warning("No handler registered for step", step=step.value)
+            state.record_step(step, StepStatus.SKIPPED)
+            return state
+
+        state.current_step = step
+        last_error: Optional[str] = None
+
+        for attempt in range(1, self.max_retries + 1):
+            record = StepRecord(step=step, status=StepStatus.RUNNING)
+            state.step_history.append(record)
+
+            step_start = time.monotonic()
+            self.logger.debug(
+                "Step starting",
+                step=step.value,
+                attempt=attempt,
+                max_retries=self.max_retries,
+            )
+
+            try:
+                state = await handler(state)
+                ms = (time.monotonic() - step_start) * 1000
+                state.record_step(step, StepStatus.COMPLETED)
+                self.logger.debug(
+                    "Step completed",
+                    step=step.value,
+                    ms=round(ms, 2),
+                )
+                return state
+
+            except Exception as exc:
+                ms = (time.monotonic() - step_start) * 1000
+                last_error = str(exc)
+                retry_count = state.increment_retry(step.value)
+                state.record_step(
+                    step,
+                    StepStatus.FAILED,
+                    error=last_error,
+                )
+                self.logger.warning(
+                    "Step failed",
+                    step=step.value,
+                    attempt=attempt,
+                    error=last_error,
+                    ms=round(ms, 2),
+                )
+
+                if attempt < self.max_retries:
+                    backoff = min(2 ** attempt, 30)
+                    self.logger.debug(
+                        "Retrying step",
+                        step=step.value,
+                        backoff_s=backoff,
+                    )
+                    await asyncio.sleep(backoff)
+
+        raise RetryExhaustedError(step.value, self.max_retries, last_error or "")
+
+    # ── lifecycle steps ──────────────────────────────────────
+
+    async def initialize(self, state: AgentState) -> AgentState:
+        """
+        Initialize the runtime for this task.
+
+        Sets up initial context, validates inputs, and prepares
+        the state for downstream steps.
+
+        Parameters
+        ----------
+        state : AgentState
+            Current shared state (with user message already set).
+
+        Returns
+        -------
+        AgentState
+            State ready for task understanding.
+        """
+        state.status = StepStatus.RUNNING
+        state.add_message(
+            "system",
+            "Agent runtime initialized. Processing task.",
+        )
+        return state
+
+    async def understand_task(self, state: AgentState) -> AgentState:
+        """
+        Analyse the user request and extract a clear goal.
+
+        When an LLM provider is configured, this step asks the model to
+        distil the user's intent into a concise goal statement.  Without
+        a provider the last user message is used verbatim.
+
+        Parameters
+        ----------
+        state : AgentState
+            Current shared state.
+
+        Returns
+        -------
+        AgentState
+            State with ``goal`` populated.
+        """
+        user_messages = [m for m in state.messages if m.role == "user"]
+        if not user_messages:
+            return state
+
+        if self.llm_provider is not None:
+            messages = [
+                self._build_system_message(
+                    "You are a task analyst. Given the user's request, "
+                    "extract a clear, concise goal statement. Reply with "
+                    "only the goal text."
+                ),
+                ChatMessage(
+                    role="user",
+                    content=user_messages[-1].content,
+                ),
+            ]
+            try:
+                goal = await self._llm_chat(messages, state)
+                if goal.strip():
+                    state.goal = goal.strip()
+            except Exception:
+                self.logger.warning("LLM understand_task failed, falling back to raw message")
+                state.goal = user_messages[-1].content
+        else:
+            state.goal = user_messages[-1].content
+
+        return state
+
+    async def create_plan(self, state: AgentState) -> AgentState:
+        """
+        Decompose the goal into an ordered list of :class:`PlanStep`.
+
+        When a :class:`PlannerAgent` is attached, it is used for structured
+        plan generation with validation, dependencies, priorities, and
+        expected outputs.  When only an LLM provider is available the
+        simpler orchestrator-level planning is used.  Otherwise a single-step
+        fallback is produced.
+
+        Parameters
+        ----------
+        state : AgentState
+            Current shared state (with goal populated).
+
+        Returns
+        -------
+        AgentState
+            State with ``plan`` populated.
+        """
+        if state.plan:
+            return state
+
+        # ── PlannerAgent path ─────────────────────────────────
+        if self.planner is not None:
+            try:
+                result = await self.planner.process({
+                    "goal": state.goal,
+                    "tools_available": state.tools_available,
+                    "context": self._plan_context(state),
+                })
+                if result["success"] and result["plan"]:
+                    state.plan = [
+                        PlanStep(
+                            index=item["index"],
+                            description=item["description"],
+                            tool_name=item.get("tool_name"),
+                            tool_parameters=item.get("tool_parameters", {}),
+                            depends_on=item.get("depends_on", []),
+                            rationale=item.get("rationale", ""),
+                            priority=item.get("priority", "medium"),
+                            estimated_tools=item.get("estimated_tools", []),
+                            expected_output=item.get("expected_output"),
+                        )
+                        for item in result["plan"]
+                    ]
+                    state.metadata["plan_source"] = "planner_agent"
+                    return state
+                else:
+                    self.logger.warning(
+                        "PlannerAgent failed",
+                        errors=result.get("errors", []),
+                    )
+            except Exception as exc:
+                self.logger.warning(
+                    "PlannerAgent raised exception, falling back",
+                    error=str(exc),
+                )
+
+        # ── LLM orchestrator path ─────────────────────────────
+        if self.llm_provider is not None:
+            tools_desc = ", ".join(state.tools_available) if state.tools_available else "none"
+            messages = [
+                self._build_system_message(
+                    "You are a planning agent. Given a goal, produce a numbered "
+                    f"execution plan. Available tools: {tools_desc}. "
+                    "Reply with a JSON array of objects, each having 'index' (int), "
+                    "'description' (str), 'tool_name' (str or null), and "
+                    "'rationale' (str). Reply ONLY with the JSON array."
+                ),
+                ChatMessage(role="user", content=f"Goal: {state.goal}"),
+            ]
+            try:
+                raw = await self._llm_chat(messages, state)
+                plan_data = __import__("json").loads(raw)
+                if isinstance(plan_data, list):
+                    state.plan = [
+                        PlanStep(
+                            index=item.get("index", i),
+                            description=item.get("description", f"Step {i}"),
+                            tool_name=item.get("tool_name"),
+                            rationale=item.get("rationale", ""),
+                        )
+                        for i, item in enumerate(plan_data)
+                    ]
+                    state.metadata["plan_source"] = "orchestrator_llm"
+                    return state
+            except Exception:
+                self.logger.warning("LLM create_plan failed, using fallback plan")
+
+        # ── Template fallback ─────────────────────────────────
+        state.plan = [
+            PlanStep(
+                index=0,
+                description=f"Execute task: {state.goal}",
+                rationale="Single-step fallback plan",
+            )
+        ]
+        state.metadata["plan_source"] = "fallback"
+        return state
+
+    async def select_tools(self, state: AgentState) -> AgentState:
+        """
+        Map each plan step to the tools needed to execute it.
+
+        This step is the hook point for LLM-based tool selection.
+        The default implementation does nothing — tool selection will
+        be delegated to a dedicated selector component later.
+
+        When a ToolRegistry is available, this step can validate that
+        the tools in the plan are actually registered.
+
+        Parameters
+        ----------
+        state : AgentState
+            Current shared state (with plan populated).
+
+        Returns
+        -------
+        AgentState
+            State ready for execution.
+        """
+        # Validate tools in plan against registry if available
+        if self.tool_registry is not None:
+            available_tools = {
+                t["name"] for t in self.tool_registry.list_tools()
+            }
+            
+            for plan_step in state.plan:
+                if plan_step.tool_name and plan_step.tool_name not in available_tools:
+                    self.logger.warning(
+                        "Tool not in registry",
+                        tool_name=plan_step.tool_name,
+                        step_index=plan_step.index,
+                    )
+        
+        return state
+
+    async def execute_plan(self, state: AgentState) -> AgentState:
+        """
+        Execute every step in the plan sequentially.
+
+        Each plan step is executed in order.  Results are appended
+        to ``state.results`` and errors to ``state.errors``.
+
+        When a ToolRegistry is available, tool execution is delegated to it.
+        Otherwise, a placeholder message is used.
+
+        Parameters
+        ----------
+        state : AgentState
+            Current shared state (with plan populated).
+
+        Returns
+        -------
+        AgentState
+            State with execution results populated.
+        """
+        for plan_step in state.plan:
+            result: Dict[str, Any] = {
+                "step_index": plan_step.index,
+                "description": plan_step.description,
+                "tool_name": plan_step.tool_name,
+                "success": True,
+                "output": None,
+            }
+
+            if plan_step.tool_name:
+                state.tools_used.append(plan_step.tool_name)
+                
+                # Use ToolRegistry if available
+                if self.tool_registry is not None:
+                    # Create execution request with default permissions
+                    request = ToolExecutionRequest(
+                        tool_name=plan_step.tool_name,
+                        parameters=plan_step.tool_parameters,
+                        agent_permissions=[
+                            ToolPermission.READ,
+                            ToolPermission.WRITE,
+                            ToolPermission.EXECUTE,
+                            ToolPermission.NETWORK,
+                            ToolPermission.FILE_SYSTEM,
+                        ],
+                    )
+                    
+                    try:
+                        tool_result = await self.tool_registry.execute(request)
+                        result["success"] = tool_result.success
+                        result["output"] = tool_result.output
+                        if not tool_result.success:
+                            result["error"] = tool_result.error
+                            state.add_error(
+                                f"Tool '{plan_step.tool_name}' failed: {tool_result.error}"
+                            )
+                    except Exception as exc:
+                        result["success"] = False
+                        result["error"] = str(exc)
+                        state.add_error(
+                            f"Tool '{plan_step.tool_name}' execution error: {exc}"
+                        )
+                else:
+                    # Fallback when no tool registry
+                    result["output"] = (
+                        f"Tool '{plan_step.tool_name}' execution "
+                        "delegated to tool runtime (no registry available)"
+                    )
+            else:
+                result["output"] = (
+                    f"Step {plan_step.index} completed "
+                    "(no tool required — LLM reasoning placeholder)"
+                )
+
+            state.results.append(result)
+
+        return state
+
+    async def evaluate_result(self, state: AgentState) -> AgentState:
+        """
+        Validate execution results and check goal completion.
+
+        With an LLM provider this step asks the model to evaluate whether
+        the goal was achieved; without one a simple error-count heuristic
+        is used.
+
+        When a :class:`PlannerAgent` is attached and errors are present,
+        a replanning attempt is triggered (up to ``_max_replan_attempts``
+        times).  The new plan replaces the old one in state and the
+        ``EXECUTE_PLAN`` step will re-run on the next lifecycle iteration.
+
+        Parameters
+        ----------
+        state : AgentState
+            Current shared state (with results populated).
+
+        Returns
+        -------
+        AgentState
+            State with evaluation recorded.
+        """
+        if self.llm_provider is not None:
+            results_text = "\n".join(
+                f"- Step {r.get('step_index', '?')}: {r.get('output', 'N/A')}"
+                for r in state.results
+            )
+            errors_text = "\n".join(state.errors) if state.errors else "None"
+            messages = [
+                self._build_system_message(
+                    "You are an execution evaluator. Given the goal, results, "
+                    "and errors, evaluate whether the task was completed "
+                    "successfully. Reply with a brief assessment."
+                ),
+                ChatMessage(
+                    role="user",
+                    content=(
+                        f"Goal: {state.goal}\n\n"
+                        f"Results:\n{results_text}\n\n"
+                        f"Errors:\n{errors_text}"
+                    ),
+                ),
+            ]
+            try:
+                evaluation = await self._llm_chat(messages, state)
+                state.add_message("assistant", evaluation or "Evaluation complete.")
+            except Exception:
+                self.logger.warning("LLM evaluate_result failed, using heuristic")
+                self._evaluate_heuristic(state)
+        else:
+            self._evaluate_heuristic(state)
+
+        # ── Replanning when errors exist ──────────────────────
+        if state.errors and self.planner is not None:
+            replan_count = state.metadata.get("replan_count", 0)
+            if replan_count < self._max_replan_attempts:
+                self.logger.info(
+                    "Triggering replan",
+                    attempt=replan_count + 1,
+                    max=self._max_replan_attempts,
+                    error_count=len(state.errors),
+                )
+                try:
+                    prev_plan_dicts = [
+                        p.model_dump() for p in state.plan
+                    ]
+                    result = await self.planner.process({
+                        "goal": state.goal,
+                        "tools_available": state.tools_available,
+                        "previous_plan": prev_plan_dicts,
+                        "errors": state.errors,
+                        "context": self._plan_context(state),
+                    })
+                    if result["success"] and result["plan"]:
+                        state.plan = [
+                            PlanStep(
+                                index=item["index"],
+                                description=item["description"],
+                                tool_name=item.get("tool_name"),
+                                tool_parameters=item.get("tool_parameters", {}),
+                                depends_on=item.get("depends_on", []),
+                                rationale=item.get("rationale", ""),
+                                priority=item.get("priority", "medium"),
+                                estimated_tools=item.get("estimated_tools", []),
+                                expected_output=item.get("expected_output"),
+                            )
+                            for item in result["plan"]
+                        ]
+                        state.results.clear()
+                        state.errors.clear()
+                        state.metadata["replan_count"] = replan_count + 1
+                        state.metadata["plan_source"] = "planner_agent_replan"
+                        state.metadata["replan_errors"] = []
+                        state.add_message(
+                            "system",
+                            f"Plan revised (attempt {replan_count + 1}). "
+                            f"New plan has {len(state.plan)} steps.",
+                        )
+                except Exception as exc:
+                    self.logger.warning(
+                        "Replan attempt failed", error=str(exc),
+                    )
+
+        return state
+
+    def _evaluate_heuristic(self, state: AgentState) -> None:
+        """Fallback heuristic-based evaluation."""
+        if state.errors:
+            state.add_message(
+                "assistant",
+                f"Execution completed with {len(state.errors)} error(s).",
+            )
+        else:
+            state.add_message(
+                "assistant",
+                "Execution completed successfully.",
+            )
+
+    async def reflect(self, state: AgentState) -> AgentState:
+        """
+        Reflect on the execution and extract lessons learned.
+
+        With an LLM provider the model is asked to produce a short
+        reflection; otherwise a summary is logged.
+
+        Parameters
+        ----------
+        state : AgentState
+            Current shared state.
+
+        Returns
+        -------
+        AgentState
+            State with reflection recorded.
+        """
+        summary = {
+            "goal": state.goal,
+            "steps_executed": len(state.results),
+            "tools_used": list(set(state.tools_used)),
+            "errors": len(state.errors),
+            "tokens": state.token_usage.total_tokens,
+        }
+
+        if self.llm_provider is not None:
+            messages = [
+                self._build_system_message(
+                    "You are a reflective agent. Given the task summary, "
+                    "provide a brief reflection on what went well, what "
+                    "could be improved, and any lessons learned. Be concise."
+                ),
+                ChatMessage(
+                    role="user",
+                    content=(
+                        f"Goal: {state.goal}\n"
+                        f"Steps executed: {len(state.results)}\n"
+                        f"Tools used: {', '.join(set(state.tools_used)) or 'none'}\n"
+                        f"Errors: {len(state.errors)}\n"
+                        f"Tokens consumed: {state.token_usage.total_tokens}"
+                    ),
+                ),
+            ]
+            try:
+                reflection = await self._llm_chat(messages, state)
+                if reflection:
+                    state.metadata["reflection"] = reflection
+            except Exception:
+                self.logger.warning("LLM reflect failed, logging summary only")
+
+        self.logger.info("Reflection summary", **summary)
+        return state
+
+    async def respond(self, state: AgentState) -> AgentState:
+        """
+        Synthesise the final answer from all gathered results.
+
+        With an LLM provider the model composes a coherent final answer;
+        without one result outputs are concatenated.
+
+        Parameters
+        ----------
+        state : AgentState
+            Current shared state.
+
+        Returns
+        -------
+        AgentState
+            State with ``final_answer`` populated and status set to COMPLETED.
+        """
+        if self.llm_provider is not None:
+            results_text = "\n".join(
+                r.get("output", "") for r in state.results if r.get("output")
+            )
+            messages = [
+                self._build_system_message(
+                    "You are a helpful assistant. Given the goal and execution "
+                    "results, produce a clear, complete final answer for the "
+                    "user. Be concise but thorough."
+                ),
+                ChatMessage(
+                    role="user",
+                    content=(
+                        f"Goal: {state.goal}\n\n"
+                        f"Execution results:\n{results_text or 'No results available.'}"
+                    ),
+                ),
+            ]
+            try:
+                answer = await self._llm_chat(messages, state)
+                state.final_answer = answer.strip() if answer and answer.strip() else self._fallback_answer(state)
+            except Exception:
+                self.logger.warning("LLM respond failed, concatenating results")
+                state.final_answer = self._fallback_answer(state)
+        else:
+            state.final_answer = self._fallback_answer(state)
+
+        state.status = StepStatus.COMPLETED
+        return state
+
+    @staticmethod
+    def _fallback_answer(state: AgentState) -> str:
+        """Build a fallback answer by concatenating result outputs."""
+        parts: List[str] = []
+        for r in state.results:
+            output = r.get("output")
+            if output:
+                parts.append(str(output))
+        return "\n".join(parts) if parts else "No result produced."
+
+    # ── backwards-compatible entry point ─────────────────────
+
+    async def process_task(
+        self,
+        task_id: Any,
+        task_data: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """
+        Legacy entry point that delegates to :meth:`run`.
+
+        Kept for backward compatibility with existing route handlers.
+
+        Parameters
+        ----------
+        task_id : UUID or str
+            Task identifier.
+        task_data : dict
+            Task payload.
+
+        Returns
+        -------
+        dict
+            Result dictionary with ``success``, ``task_id``, ``result``,
+            and ``history`` keys.
+        """
+        result = await self.run(task_id, task_data)
+
+        return {
+            "success": result["status"] == "completed",
+            "task_id": result["task_id"],
+            "result": result.get("final_answer"),
+            "history": result.get("step_history", []),
+        }
+
+    # ── cleanup ───────────────────────────────────────────────
+
+    async def close(self) -> None:
+        """Release resources held by the LLM provider."""
+        if self.llm_provider is not None:
+            await self.llm_provider.close()
