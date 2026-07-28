@@ -29,3 +29,6 @@ structlog>=23.2.0
 
 # Utilities
 python-multipart>=0.0.6
+
+# Sandbox / Docker Execution
+docker>=7.0.0

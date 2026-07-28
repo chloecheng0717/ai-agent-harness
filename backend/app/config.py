@@ -93,6 +93,15 @@ class Settings(BaseSettings):
         description="Episodic memory PostgreSQL URL (empty for in-memory)",
     )
 
+    # Sandbox / Docker Execution
+    sandbox_enabled: bool = Field(default=False, description="Enable Docker sandbox execution")
+    sandbox_image: str = Field(default="python:3.12-slim", description="Docker image for sandbox")
+    sandbox_memory_limit: str = Field(default="512m", description="Sandbox container memory limit")
+    sandbox_cpu_limit: float = Field(default=1.0, description="Sandbox container CPU limit")
+    sandbox_timeout: int = Field(default=30, description="Sandbox execution timeout in seconds")
+    sandbox_network_disabled: bool = Field(default=True, description="Disable sandbox networking")
+    sandbox_workspace_dir: str = Field(default="", description="Base dir for sandbox workspaces (empty for system tmpdir)")
+
     # RAG / Knowledge Base
     rag_enabled: bool = Field(default=True, description="Enable RAG knowledge system")
     rag_collection_name: str = Field(default="knowledge_base", description="RAG knowledge base collection name")
