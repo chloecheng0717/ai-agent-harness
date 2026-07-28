@@ -3,13 +3,23 @@ Reasoning Loop Module
 
 This module implements the ReAct (Reason + Act) pattern for agent reasoning.
 It provides the core reasoning loop that agents use to process tasks.
+
+Includes built-in flag detection that terminates the loop when a CTF flag
+pattern is found in tool output or agent reasoning.
 """
 
+import re
 from typing import Any, Dict, List, Optional
 
 import structlog
 
 from app.config import get_settings
+
+# Default patterns for CTF flag detection
+DEFAULT_FLAG_PATTERNS: List[str] = [
+    r"flag\{[^\}]+\}",
+    r"CTF\{[^\}]+\}",
+]
 
 
 class ReasoningStep:
@@ -45,6 +55,67 @@ class ReasoningStep:
         self.observation = observation
 
 
+class FlagDetector:
+    """
+    Scans text for CTF flag patterns.
+
+    Attributes:
+        patterns: Compiled regex patterns to match.
+    """
+
+    def __init__(
+        self,
+        flag_patterns: Optional[List[str]] = None,
+    ) -> None:
+        """
+        Initialise the detector.
+
+        Parameters
+        ----------
+        flag_patterns : list[str] | None
+            Regex strings.  Defaults to ``DEFAULT_FLAG_PATTERNS``.
+        """
+        raw = flag_patterns if flag_patterns else DEFAULT_FLAG_PATTERNS
+        self.patterns = [re.compile(p, re.IGNORECASE) for p in raw]
+        self.logger = structlog.get_logger().bind(component="flag_detector")
+
+    def scan(self, text: str) -> Optional[str]:
+        """
+        Return the first flag match found in *text*, or ``None``.
+        """
+        if not text:
+            return None
+        for pattern in self.patterns:
+            match = pattern.search(text)
+            if match:
+                self.logger.info(
+                    "Flag detected",
+                    flag=match.group(0),
+                )
+                return match.group(0)
+        return None
+
+    def scan_dict(self, data: Dict[str, Any]) -> Optional[str]:
+        """
+        Recursively scan a dictionary (or list of dicts) for flag patterns.
+
+        Handles nested dicts, lists, and string values.
+        """
+        if isinstance(data, str):
+            return self.scan(data)
+        if isinstance(data, dict):
+            for value in data.values():
+                result = self.scan_dict(value)
+                if result:
+                    return result
+        if isinstance(data, list):
+            for item in data:
+                result = self.scan_dict(item)
+                if result:
+                    return result
+        return None
+
+
 class ReasoningLoop:
     """
     ReAct reasoning loop implementation.
@@ -57,23 +128,32 @@ class ReasoningLoop:
     The loop continues until:
     - The task is completed
     - Maximum iterations are reached
+    - A CTF flag is detected in output (flag detection)
     - An error occurs
     
     Attributes:
         settings: Application settings
         logger: Structured logger
         max_iterations: Maximum number of iterations
+        flag_detector: FlagDetector instance for flag detection
     """
     
-    def __init__(self, max_iterations: Optional[int] = None) -> None:
+    def __init__(
+        self,
+        max_iterations: Optional[int] = None,
+        flag_patterns: Optional[List[str]] = None,
+    ) -> None:
         """
         Initialize the reasoning loop.
         
         Args:
             max_iterations: Maximum iterations (uses config if not provided)
+            flag_patterns: Custom regex patterns for flag detection.
+                Defaults to ``DEFAULT_FLAG_PATTERNS``.
         """
         self.settings = get_settings()
         self.max_iterations = max_iterations or self.settings.max_iterations
+        self.flag_detector = FlagDetector(flag_patterns)
         
         self.logger = structlog.get_logger().bind(component="reasoning_loop")
         self.logger.info(
@@ -104,6 +184,7 @@ class ReasoningLoop:
         
         state = initial_state.copy()
         history: List[ReasoningStep] = []
+        found_flag: Optional[str] = None
         
         for iteration in range(self.max_iterations):
             self.logger.debug(
@@ -115,11 +196,31 @@ class ReasoningLoop:
             # Reason: Generate thought
             thought = await reasoning_fn(state)
             
+            # Check thought for flags
+            found_flag = self.flag_detector.scan(thought)
+            if found_flag:
+                self.logger.info("Flag found in agent thought", flag=found_flag)
+                step = ReasoningStep(
+                    thought=thought,
+                    action="flag_found",
+                    action_input={"flag": found_flag},
+                    observation={"flag": found_flag},
+                )
+                history.append(step)
+                state = await self._update_state(state, step)
+                break
+            
             # Act: Decide and execute action
             action, action_input = await self._decide_action(thought, state)
             
             # Observe: Get action result
             observation = await action_fn(action, action_input)
+            
+            # Check observation for flags
+            if isinstance(observation, dict):
+                found_flag = self.flag_detector.scan_dict(observation)
+            elif isinstance(observation, str):
+                found_flag = self.flag_detector.scan(observation)
             
             # Record step
             step = ReasoningStep(
@@ -132,6 +233,15 @@ class ReasoningLoop:
             
             # Update state
             state = await self._update_state(state, step)
+            
+            # Terminate if flag found
+            if found_flag:
+                self.logger.info(
+                    "Flag found in observation — terminating loop",
+                    flag=found_flag,
+                )
+                state["found_flag"] = found_flag
+                break
             
             # Check if task is complete
             if await self._is_complete(state):
@@ -150,6 +260,7 @@ class ReasoningLoop:
                 for step in history
             ],
             "iterations": len(history),
+            "found_flag": found_flag,
         }
     
     async def _decide_action(
