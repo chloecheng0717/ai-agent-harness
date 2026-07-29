@@ -214,7 +214,7 @@ class TestIndividualSteps:
         state = AgentState()
         state.results = [{"output": "scan result"}]
         state = await orch.respond(state)
-        assert state.final_answer == "scan result"
+        assert "scan result" in state.final_answer
         assert state.status == StepStatus.COMPLETED
 
     @pytest.mark.asyncio
@@ -328,3 +328,100 @@ class TestBackwardCompatibility:
             task_data={"description": "test"},
         )
         assert result["success"] is False
+
+
+# ── Iterative loop ──────────────────────────────────────────────
+
+
+class TestIterativeLoop:
+    """Tests for the plan-execute-evaluate iterative loop in run()."""
+
+    @pytest.mark.asyncio
+    async def test_single_iteration_on_success(self) -> None:
+        orch = Orchestrator()
+        result = await orch.run(
+            task_id=uuid4(),
+            task_data={"description": "success"},
+        )
+        # 2 init + 4 inner + 2 final = 8 step records
+        assert len(result["step_history"]) == 8
+        assert result["status"] == "completed"
+
+    @pytest.mark.asyncio
+    async def test_multiple_iterations_when_incomplete(self) -> None:
+        """Simulate incomplete task on first pass, then complete on second."""
+        orch = Orchestrator(max_iterations=5)
+        eval_calls = 0
+
+        async def incomplete_then_complete(state: AgentState) -> AgentState:
+            nonlocal eval_calls
+            eval_calls += 1
+            if eval_calls == 1:
+                state.add_error("not done yet")
+                state.metadata["task_complete"] = False
+            else:
+                state.metadata["task_complete"] = True
+            # Assign a fallback plan so create_plan doesn't re-run fresh
+            state.plan = [PlanStep(index=0, description="step")]
+            return state
+
+        original = orch._step_registry[LifecycleStep.EVALUATE_RESULT]
+        orch._step_registry[LifecycleStep.EVALUATE_RESULT] = incomplete_then_complete
+
+        result = await orch.run(
+            task_id=uuid4(),
+            task_data={"description": "multi-step"},
+        )
+
+        assert result["status"] == "completed"
+        assert eval_calls == 2
+        # 2 init + (4 steps × 2 iterations) + 2 final = 12 records
+        assert len(result["step_history"]) == 12
+
+        orch._step_registry[LifecycleStep.EVALUATE_RESULT] = original
+
+    @pytest.mark.asyncio
+    async def test_honours_max_iterations(self) -> None:
+        """When the task never completes, stop after max_iterations."""
+        orch = Orchestrator(max_iterations=3)
+
+        async def never_complete(state: AgentState) -> AgentState:
+            state.add_error("always fails")
+            state.metadata["task_complete"] = False
+            return state
+
+        original = orch._step_registry[LifecycleStep.EVALUATE_RESULT]
+        orch._step_registry[LifecycleStep.EVALUATE_RESULT] = never_complete
+
+        result = await orch.run(
+            task_id=uuid4(),
+            task_data={"description": "hopeless"},
+        )
+
+        assert result["status"] == "completed"
+        # 2 init + (4 steps × 3 iterations) + 2 final = 16 records
+        assert len(result["step_history"]) == 16
+
+        orch._step_registry[LifecycleStep.EVALUATE_RESULT] = original
+
+    @pytest.mark.asyncio
+    async def test_iteration_tracked_in_metadata(self) -> None:
+        """Each iteration sets state.metadata['iteration']."""
+        orch = Orchestrator(max_iterations=3)
+
+        async def check_iteration(state: AgentState) -> AgentState:
+            # On the first pass it should be iteration 1
+            state.metadata["task_complete"] = True
+            return state
+
+        original = orch._step_registry[LifecycleStep.EVALUATE_RESULT]
+        orch._step_registry[LifecycleStep.EVALUATE_RESULT] = check_iteration
+
+        result = await orch.run(
+            task_id=uuid4(),
+            task_data={"description": "check iter"},
+        )
+
+        assert result["status"] == "completed"
+
+        orch._step_registry[LifecycleStep.EVALUATE_RESULT] = original

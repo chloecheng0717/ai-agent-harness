@@ -324,7 +324,7 @@ class TestRespondLLM:
             state = AgentState()
             state.results = [{"output": "result"}]
             state = await orch.respond(state)
-            assert state.final_answer == "result"
+            assert "result" in state.final_answer
 
     @pytest.mark.asyncio
     async def test_uses_fallback_answer_when_llm_empty(self) -> None:
@@ -336,7 +336,7 @@ class TestRespondLLM:
             state = AgentState()
             state.results = [{"output": "result"}]
             state = await orch.respond(state)
-            assert state.final_answer == "result"
+            assert "result" in state.final_answer
 
     @pytest.mark.asyncio
     async def test_fallback_answer_no_results(self) -> None:

@@ -82,6 +82,7 @@ class Orchestrator:
     settings : Application settings
     logger  : Structured logger bound to the orchestrator component
     max_retries : Maximum retry attempts per step (from config)
+    max_iterations : Maximum plan-execute-evaluate loop iterations
     _step_registry : Mapping of lifecycle step → handler function
     """
 
@@ -91,15 +92,16 @@ class Orchestrator:
         planner: Optional["PlannerAgent"] = None,
         tool_registry: Optional["ToolRegistry"] = None,
         memory_manager: Optional["MemoryManager"] = None,
+        max_iterations: Optional[int] = None,
     ) -> None:
         self.settings = get_settings()
         self.logger = structlog.get_logger().bind(component="orchestrator")
         self.max_retries: int = 3
+        self.max_iterations: int = max_iterations or self.settings.max_iterations
         self.llm_provider = llm_provider
         self.planner = planner
         self.tool_registry = tool_registry
         self.memory_manager = memory_manager
-        self._max_replan_attempts: int = 2
 
         # Step registry — maps lifecycle steps to handler methods.
         # Subclasses or callers can override individual entries.
@@ -181,6 +183,8 @@ class Orchestrator:
     def _plan_context(self, state: AgentState) -> str:
         """Build extra context string for the PlannerAgent."""
         parts: List[str] = []
+        iteration = state.metadata.get("iteration", 1)
+        parts.append(f"Iteration: {iteration}")
         if state.metadata.get("replan_errors"):
             parts.append(
                 "Previous execution failed with errors: "
@@ -188,6 +192,14 @@ class Orchestrator:
             )
         if state.metadata.get("replan_feedback"):
             parts.append(f"Feedback: {state.metadata['replan_feedback']}")
+        if state.metadata.get("previous_plan"):
+            prev_descs = [
+                p.get("description", "")
+                for p in state.metadata["previous_plan"]
+            ]
+            parts.append(
+                "Previous plan steps: " + " -> ".join(prev_descs)
+            )
         return "\n".join(parts)
 
     # ── public entry point ───────────────────────────────────
@@ -201,9 +213,14 @@ class Orchestrator:
         """
         Execute the full agent lifecycle for a task.
 
-        This is the main entry point. It creates an :class:`AgentState`,
-        runs every lifecycle step in order, and returns a serialisable
-        result dictionary.
+        This is the main entry point. It creates an :class:`AgentState`
+        and drives a three-phase execution:
+
+        1. **Initialisation** — ``INITIALIZE``, ``UNDERSTAND_TASK``
+        2. **Iterative loop** — ``CREATE_PLAN → SELECT_TOOLS → EXECUTE_PLAN
+           → EVALUATE_RESULT``, repeating up to *max_iterations* times until
+           the task is complete.
+        3. **Finalisation** — ``REFLECT → RESPOND``
 
         Parameters
         ----------
@@ -230,14 +247,65 @@ class Orchestrator:
         self.logger.info(
             "Lifecycle started",
             task_id=str(state.task_id),
-            steps=len(self._step_registry),
+            max_iterations=self.max_iterations,
         )
 
         overall_start = time.monotonic()
 
         try:
-            for step in LifecycleStep:
+            # ── Phase 1: Initialisation (always runs once) ───────────
+            for step in (LifecycleStep.INITIALIZE, LifecycleStep.UNDERSTAND_TASK):
                 state = await self._run_step(step, state)
+
+            # ── Phase 2: Iterative plan-execute-evaluate loop ─────────
+            _inner_steps = (
+                LifecycleStep.CREATE_PLAN,
+                LifecycleStep.SELECT_TOOLS,
+                LifecycleStep.EXECUTE_PLAN,
+                LifecycleStep.EVALUATE_RESULT,
+            )
+
+            for iteration in range(1, self.max_iterations + 1):
+                state.metadata["iteration"] = iteration
+                self.logger.info(
+                    "Plan-execute-evaluate iteration",
+                    iteration=iteration,
+                    max_iterations=self.max_iterations,
+                )
+
+                if iteration > 1:
+                    # Stash previous execution context before clearing
+                    if state.errors:
+                        state.metadata["replan_errors"] = state.errors.copy()
+                    if state.plan:
+                        state.metadata["previous_plan"] = [
+                            p.model_dump() for p in state.plan
+                        ]
+                    state.plan.clear()
+                    state.results.clear()
+                    state.errors.clear()
+                    state.tools_used.clear()
+
+                for step in _inner_steps:
+                    state = await self._run_step(step, state)
+
+                if state.metadata.get("task_complete", False):
+                    self.logger.info(
+                        "Task completed successfully",
+                        iteration=iteration,
+                    )
+                    break
+
+                self.logger.info(
+                    "Task not yet complete — re-planning",
+                    iteration=iteration,
+                    error_count=len(state.errors),
+                )
+
+            # ── Phase 3: Finalisation (always runs once) ─────────────
+            state = await self._run_step(LifecycleStep.REFLECT, state)
+            state = await self._run_step(LifecycleStep.RESPOND, state)
+
         except RetryExhaustedError as exc:
             state.status = StepStatus.FAILED
             state.add_error(str(exc))
@@ -262,6 +330,7 @@ class Orchestrator:
             "Lifecycle finished",
             task_id=str(state.task_id),
             status=state.status.value,
+            iterations=state.metadata.get("iteration", 1),
             overall_ms=round(overall_ms, 2),
             token_usage=state.token_usage.total_tokens,
         )
@@ -489,7 +558,7 @@ class Orchestrator:
                     "'description' (str), 'tool_name' (str or null), and "
                     "'rationale' (str). Reply ONLY with the JSON array."
                 ),
-                ChatMessage(role="user", content=f"Goal: {state.goal}"),
+                ChatMessage(role="user", content=f"Goal: {state.goal}\n\n{self._plan_context(state)}".strip()),
             ]
             try:
                 raw = await self._llm_chat(messages, state)
@@ -643,10 +712,9 @@ class Orchestrator:
         the goal was achieved; without one a simple error-count heuristic
         is used.
 
-        When a :class:`PlannerAgent` is attached and errors are present,
-        a replanning attempt is triggered (up to ``_max_replan_attempts``
-        times).  The new plan replaces the old one in state and the
-        ``EXECUTE_PLAN`` step will re-run on the next lifecycle iteration.
+        The outcome is stored in ``state.metadata["task_complete"]`` so
+        that the outer loop in :meth:`run` knows whether to continue
+        iterating.
 
         Parameters
         ----------
@@ -668,7 +736,8 @@ class Orchestrator:
                 self._build_system_message(
                     "You are an execution evaluator. Given the goal, results, "
                     "and errors, evaluate whether the task was completed "
-                    "successfully. Reply with a brief assessment."
+                    "successfully. Begin your response with COMPLETE: YES or "
+                    "COMPLETE: NO, then provide a brief assessment."
                 ),
                 ChatMessage(
                     role="user",
@@ -682,73 +751,37 @@ class Orchestrator:
             try:
                 evaluation = await self._llm_chat(messages, state)
                 state.add_message("assistant", evaluation or "Evaluation complete.")
+                self._set_task_complete_from_eval(state, evaluation)
+                if not state.metadata.get("task_complete"):
+                    state.metadata["replan_feedback"] = evaluation
             except Exception:
                 self.logger.warning("LLM evaluate_result failed, using heuristic")
                 self._evaluate_heuristic(state)
         else:
             self._evaluate_heuristic(state)
 
-        # ── Replanning when errors exist ──────────────────────
-        if state.errors and self.planner is not None:
-            replan_count = state.metadata.get("replan_count", 0)
-            if replan_count < self._max_replan_attempts:
-                self.logger.info(
-                    "Triggering replan",
-                    attempt=replan_count + 1,
-                    max=self._max_replan_attempts,
-                    error_count=len(state.errors),
-                )
-                try:
-                    prev_plan_dicts = [
-                        p.model_dump() for p in state.plan
-                    ]
-                    result = await self.planner.process({
-                        "goal": state.goal,
-                        "tools_available": state.tools_available,
-                        "previous_plan": prev_plan_dicts,
-                        "errors": state.errors,
-                        "context": self._plan_context(state),
-                    })
-                    if result["success"] and result["plan"]:
-                        state.plan = [
-                            PlanStep(
-                                index=item["index"],
-                                description=item["description"],
-                                tool_name=item.get("tool_name"),
-                                tool_parameters=item.get("tool_parameters", {}),
-                                depends_on=item.get("depends_on", []),
-                                rationale=item.get("rationale", ""),
-                                priority=item.get("priority", "medium"),
-                                estimated_tools=item.get("estimated_tools", []),
-                                expected_output=item.get("expected_output"),
-                            )
-                            for item in result["plan"]
-                        ]
-                        state.results.clear()
-                        state.errors.clear()
-                        state.metadata["replan_count"] = replan_count + 1
-                        state.metadata["plan_source"] = "planner_agent_replan"
-                        state.metadata["replan_errors"] = []
-                        state.add_message(
-                            "system",
-                            f"Plan revised (attempt {replan_count + 1}). "
-                            f"New plan has {len(state.plan)} steps.",
-                        )
-                except Exception as exc:
-                    self.logger.warning(
-                        "Replan attempt failed", error=str(exc),
-                    )
-
         return state
+
+    def _set_task_complete_from_eval(self, state: AgentState, evaluation: str) -> None:
+        """Parse the LLM evaluation response for the completion verdict."""
+        stripped = evaluation.strip().upper()
+        if stripped.startswith("COMPLETE: YES"):
+            state.metadata["task_complete"] = True
+        elif stripped.startswith("COMPLETE: NO"):
+            state.metadata["task_complete"] = False
+        else:
+            state.metadata["task_complete"] = len(state.errors) == 0
 
     def _evaluate_heuristic(self, state: AgentState) -> None:
         """Fallback heuristic-based evaluation."""
         if state.errors:
+            state.metadata["task_complete"] = False
             state.add_message(
                 "assistant",
                 f"Execution completed with {len(state.errors)} error(s).",
             )
         else:
+            state.metadata["task_complete"] = True
             state.add_message(
                 "assistant",
                 "Execution completed successfully.",

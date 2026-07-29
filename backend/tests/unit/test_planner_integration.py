@@ -261,137 +261,179 @@ class TestFullLifecycleWithPlanner:
         assert result["token_usage"]["total_tokens"] > 0
 
 
-# ── Replanning integration ───────────────────────────────────────
+# ── evaluate_result task_complete detection ───────────────────────
 
 
-class TestReplanningIntegration:
+class TestEvaluateResultCompletion:
+    """Tests that evaluate_result correctly sets the task_complete flag."""
+
     @pytest.mark.asyncio
-    async def test_replan_triggered_on_errors(self) -> None:
-        planner = PlannerAgent()
-        orch = Orchestrator(planner=planner)
-
+    async def test_sets_complete_false_when_errors_exist(self) -> None:
+        orch = Orchestrator()
         state = AgentState()
         state.goal = "scan network"
-        state.plan = [PlanStep(index=0, description="original step")]
-        state.results = [{"step_index": 0, "output": None, "success": False}]
         state.add_error("nmap timed out")
-        state.current_step = LifecycleStep.EVALUATE_RESULT
-
-        with patch.object(planner, "process", new_callable=AsyncMock) as mock:
-            mock.return_value = {
-                "success": True,
-                "plan": [
-                    {
-                        "index": 0,
-                        "description": "Revised scan with shorter timeout",
-                        "tool_name": "nmap",
-                        "depends_on": [],
-                        "rationale": "Address timeout",
-                        "priority": "high",
-                        "estimated_tools": ["nmap"],
-                        "expected_output": "Port list",
-                    }
-                ],
-                "errors": [],
-            }
-            state = await orch.evaluate_result(state)
-
-        assert len(state.plan) == 1
-        assert "Revised" in state.plan[0].description
-        assert state.metadata.get("replan_count") == 1
-        assert state.metadata.get("plan_source") == "planner_agent_replan"
-        assert len(state.results) == 0
-        assert len(state.errors) == 0
-
-    @pytest.mark.asyncio
-    async def test_no_replan_without_errors(self) -> None:
-        planner = PlannerAgent()
-        orch = Orchestrator(planner=planner)
-
-        state = AgentState()
-        state.goal = "test"
-        state.plan = [PlanStep(index=0, description="step")]
-        state.results = [{"step_index": 0, "output": "done", "success": True}]
-        state.current_step = LifecycleStep.EVALUATE_RESULT
-
-        with patch.object(planner, "process", new_callable=AsyncMock) as mock:
-            state = await orch.evaluate_result(state)
-            mock.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_no_replan_without_planner(self) -> None:
-        orch = Orchestrator()
-
-        state = AgentState()
-        state.goal = "test"
-        state.add_error("something failed")
-        state.current_step = LifecycleStep.EVALUATE_RESULT
-
         state = await orch.evaluate_result(state)
-        assert state.metadata.get("replan_count") is None
+        assert state.metadata.get("task_complete") is False
 
     @pytest.mark.asyncio
-    async def test_replan_respects_max_attempts(self) -> None:
+    async def test_sets_complete_true_when_no_errors(self) -> None:
+        orch = Orchestrator()
+        state = AgentState()
+        state.goal = "test"
+        state.results = [{"step_index": 0, "output": "done", "success": True}]
+        state = await orch.evaluate_result(state)
+        assert state.metadata.get("task_complete") is True
+
+    @pytest.mark.asyncio
+    async def test_planner_not_called_in_evaluate_result(self) -> None:
+        """The planner is no longer called inside evaluate_result;
+        replanning is handled by the outer loop in run()."""
         planner = PlannerAgent()
         orch = Orchestrator(planner=planner)
 
         state = AgentState()
         state.goal = "test"
-        state.plan = [PlanStep(index=0, description="step")]
-        state.results = []
-        state.add_error("error 1")
-        state.metadata["replan_count"] = 2
-        state.current_step = LifecycleStep.EVALUATE_RESULT
-
+        state.add_error("error")
         with patch.object(planner, "process", new_callable=AsyncMock) as mock:
             state = await orch.evaluate_result(state)
             mock.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_replan_clears_old_results_and_errors(self) -> None:
-        planner = PlannerAgent()
-        orch = Orchestrator(planner=planner)
+    async def test_parses_llm_complete_yes(self) -> None:
+        provider = _make_provider()
+        orch = Orchestrator(llm_provider=provider)
 
-        state = AgentState()
-        state.goal = "test"
-        state.plan = [PlanStep(index=0, description="old")]
-        state.results = [{"step_index": 0, "output": "failed"}]
-        state.add_error("error 1")
-        state.add_error("error 2")
-        state.current_step = LifecycleStep.EVALUATE_RESULT
-
-        with patch.object(planner, "process", new_callable=AsyncMock) as mock:
-            mock.return_value = {
-                "success": True,
-                "plan": [{"index": 0, "description": "new step", "depends_on": [],
-                          "rationale": "retry", "priority": "medium",
-                          "estimated_tools": [], "expected_output": None}],
-                "errors": [],
-            }
+        with patch.object(provider, "chat_completion", new_callable=AsyncMock) as mock:
+            mock.return_value = _make_llm_response("COMPLETE: YES\nAll goals met.")
+            state = AgentState()
+            state.goal = "test"
+            state.results = [{"step_index": 0, "output": "ok"}]
             state = await orch.evaluate_result(state)
-
-        assert len(state.results) == 0
-        assert len(state.errors) == 0
-        assert any("revised" in m.content.lower() for m in state.messages)
+            assert state.metadata.get("task_complete") is True
 
     @pytest.mark.asyncio
-    async def test_replan_failure_does_not_crash(self) -> None:
-        planner = PlannerAgent()
-        orch = Orchestrator(planner=planner)
+    async def test_parses_llm_complete_no(self) -> None:
+        provider = _make_provider()
+        orch = Orchestrator(llm_provider=provider)
 
-        state = AgentState()
-        state.goal = "test"
-        state.plan = [PlanStep(index=0, description="step")]
-        state.results = []
-        state.add_error("error")
-        state.current_step = LifecycleStep.EVALUATE_RESULT
-
-        with patch.object(planner, "process", new_callable=AsyncMock) as mock:
-            mock.side_effect = RuntimeError("planner crashed")
+        with patch.object(provider, "chat_completion", new_callable=AsyncMock) as mock:
+            mock.return_value = _make_llm_response("COMPLETE: NO\nResult does not satisfy goal.")
+            state = AgentState()
+            state.goal = "test"
+            state.results = [{"step_index": 0, "output": "partial"}]
             state = await orch.evaluate_result(state)
+            assert state.metadata.get("task_complete") is False
 
-        assert len(state.plan) == 1
-        assert state.plan[0].description == "step"
+    @pytest.mark.asyncio
+    async def test_falls_back_to_errors_when_llm_verdict_unclear(self) -> None:
+        provider = _make_provider()
+        orch = Orchestrator(llm_provider=provider)
+
+        with patch.object(provider, "chat_completion", new_callable=AsyncMock) as mock:
+            mock.return_value = _make_llm_response("Some ambiguous evaluation without verdict.")
+            state = AgentState()
+            state.goal = "test"
+            state.results = [{"step_index": 0, "output": "ok"}]
+            state = await orch.evaluate_result(state)
+            assert state.metadata.get("task_complete") is True  # no errors
+
+
+# ── Iterative loop (run) ─────────────────────────────────────────
+
+
+class TestIterativeLoop:
+    """Tests that run() loops back when evaluate_result returns incomplete."""
+
+    @pytest.mark.asyncio
+    async def test_completes_in_one_iteration_when_successful(self) -> None:
+        orch = Orchestrator(max_iterations=5)
+        result = await orch.run(
+            task_id=uuid4(),
+            task_data={"description": "simple task"},
+        )
+        assert result["status"] == "completed"
+        assert result["final_answer"] is not None
+
+    @pytest.mark.asyncio
+    async def test_replans_when_task_incomplete(self) -> None:
+        """Simulate a failure on the first execution that triggers a
+        second plan-execute-evaluate cycle."""
+        orch = Orchestrator(max_iterations=3)
+        exec_count = 0
+
+        async def counting_execute(state: AgentState) -> AgentState:
+            nonlocal exec_count
+            exec_count += 1
+            # Fallback: create a single-step plan if none exists
+            if not state.plan:
+                state.plan = [PlanStep(index=0, description="auto step")]
+            # Execute plan steps (minimal — no tool registry)
+            for ps in state.plan:
+                state.results.append({
+                    "step_index": ps.index,
+                    "description": ps.description,
+                    "success": True,
+                    "output": f"result from iteration {exec_count}",
+                })
+            return state
+
+        original_execute = orch._step_registry[LifecycleStep.EXECUTE_PLAN]
+        orch._step_registry[LifecycleStep.EXECUTE_PLAN] = counting_execute
+
+        # Override evaluate_result to report incomplete on first call,
+        # complete afterwards.
+        eval_count = 0
+
+        async def conditional_eval(state: AgentState) -> AgentState:
+            nonlocal eval_count
+            eval_count += 1
+            if eval_count == 1:
+                state.add_error("transient error")
+                state.metadata["task_complete"] = False
+            else:
+                state.metadata["task_complete"] = True
+            return state
+
+        orch._step_registry[LifecycleStep.EVALUATE_RESULT] = conditional_eval
+
+        result = await orch.run(
+            task_id=uuid4(),
+            task_data={"description": "retry task"},
+        )
+
+        assert result["status"] == "completed"
+        assert exec_count == 2
+        assert eval_count == 2
+
+        # Restore original handlers for other tests
+        orch._step_registry[LifecycleStep.EXECUTE_PLAN] = original_execute
+        orch._step_registry[LifecycleStep.EVALUATE_RESULT] = orch.evaluate_result
+
+    @pytest.mark.asyncio
+    async def test_stops_after_max_iterations(self) -> None:
+        """When the task never completes, the loop stops after max_iterations."""
+        orch = Orchestrator(max_iterations=3)
+
+        async def always_incomplete(state: AgentState) -> AgentState:
+            state.add_error("persistent error")
+            state.metadata["task_complete"] = False
+            return state
+
+        original = orch._step_registry[LifecycleStep.EVALUATE_RESULT]
+        orch._step_registry[LifecycleStep.EVALUATE_RESULT] = always_incomplete
+
+        result = await orch.run(
+            task_id=uuid4(),
+            task_data={"description": "failing task"},
+        )
+
+        assert result["status"] == "completed"
+        assert "persistent error" in result["errors"]
+        # 4 inner steps × 3 iterations + 2 init + 2 final = 16 step records
+        assert len(result["step_history"]) == 16
+
+        orch._step_registry[LifecycleStep.EVALUATE_RESULT] = original
 
 
 # ── _plan_context ────────────────────────────────────────────────
@@ -402,7 +444,7 @@ class TestPlanContext:
         orch = Orchestrator()
         state = AgentState()
         ctx = orch._plan_context(state)
-        assert ctx == ""
+        assert ctx == "Iteration: 1"
 
     def test_replan_errors_in_context(self) -> None:
         orch = Orchestrator()

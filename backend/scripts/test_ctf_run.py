@@ -7,6 +7,9 @@ End-to-end test that wires together the full CTF toolchain:
 
 Goal: "Find the flag hidden in /workspace/challenge.txt"
 
+The challenge file contains a base64-encoded zip archive. The zip
+contains flag.txt with the flag inside.
+
 Every step -- LLM thoughts, tool calls, tool outputs, and flag-detection
 results -- is printed to stdout so you can follow along.
 """
@@ -64,7 +67,7 @@ from app.tools.registry import ToolRegistry
 
 SEP = "=" * 72
 
-_TEST_DATA = os.path.join(_THIS_DIR, "..", "test_data", "challenge.txt")
+_TEST_DATA = os.path.join(_THIS_DIR, "..", "test_data", "challenge_zip.txt")
 
 
 def heading(title: str) -> None:
@@ -165,7 +168,7 @@ class PrintingOrchestrator(Orchestrator):
             "'rationale' (str). "
             "Reply with RAW JSON only -- no markdown, no code fences."
         )
-        user_msg = ChatMessage(role="user", content=f"Goal: {state.goal}")
+        user_msg = ChatMessage(role="user", content=f"Goal: {state.goal}\n\n{self._plan_context(state)}".strip())
         try:
             raw = await self._llm_chat([system_msg, user_msg], state)
             raw = raw.strip()
@@ -303,7 +306,7 @@ class PrintingOrchestrator(Orchestrator):
 
 async def main() -> int:
     print(f"\n{SEP}")
-    print("  CTF RUN TEST")
+    print("  CTF RUN TEST -- zip-in-base64 challenge")
     print(f"  Goal: Find the flag hidden in /workspace/challenge.txt")
     print(f"  Source: {_TEST_DATA}")
     print(f"{SEP}")
