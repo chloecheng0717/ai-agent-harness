@@ -196,20 +196,6 @@ class ReasoningLoop:
             # Reason: Generate thought
             thought = await reasoning_fn(state)
             
-            # Check thought for flags
-            found_flag = self.flag_detector.scan(thought)
-            if found_flag:
-                self.logger.info("Flag found in agent thought", flag=found_flag)
-                step = ReasoningStep(
-                    thought=thought,
-                    action="flag_found",
-                    action_input={"flag": found_flag},
-                    observation={"flag": found_flag},
-                )
-                history.append(step)
-                state = await self._update_state(state, step)
-                break
-            
             # Act: Decide and execute action
             action, action_input = await self._decide_action(thought, state)
             

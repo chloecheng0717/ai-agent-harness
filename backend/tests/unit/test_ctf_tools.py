@@ -705,27 +705,25 @@ class TestReasoningLoopFlagTermination:
         assert result["state"].get("found_flag") == "flag{found_it}"
 
     @pytest.mark.asyncio
-    async def test_loop_stops_on_flag_in_thought(self) -> None:
-        """Loop should stop when a flag is found in the agent's thought."""
+    async def test_flag_in_thought_does_not_trigger(self) -> None:
+        """Flags in free-text agent thought should NOT trigger detection."""
         from app.agents.core.reasoning_loop import ReasoningLoop
 
-        loop = ReasoningLoop(max_iterations=10)
+        loop = ReasoningLoop(max_iterations=5)
         call_count = 0
 
         async def reasoning_fn(state):
             nonlocal call_count
             call_count += 1
-            if call_count == 1:
-                return "I think the flag is CTF{thought_flag}"
-            return "Still thinking..."
+            return "I think the flag is CTF{thought_flag}"
 
         async def action_fn(action, action_input):
-            return {"output": "ok"}
+            return {"output": "no flag here"}
 
         result = await loop.run({}, reasoning_fn, action_fn)
 
-        assert result["iterations"] == 1
-        assert result["found_flag"] == "CTF{thought_flag}"
+        assert result["found_flag"] is None
+        assert result["iterations"] == 5
 
     @pytest.mark.asyncio
     async def test_loop_runs_full_when_no_flag(self) -> None:

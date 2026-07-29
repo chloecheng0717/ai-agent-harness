@@ -143,7 +143,6 @@ class PrintingOrchestrator(Orchestrator):
         response = await super()._llm_chat(messages, state, **kwargs)
 
         print(f"  [ASSISTANT] {trunc(response, 600)}")
-        scan_and_report(self.detector, response, "LLM response")
         return response
 
     # -- create_plan: strip markdown, inject tool_parameters ----
