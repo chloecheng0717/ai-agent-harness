@@ -214,6 +214,25 @@ class TestProcessWithLLM:
             assert "curl" in user_msg
 
     @pytest.mark.asyncio
+    async def test_passes_tool_descriptions(self) -> None:
+        provider = _make_provider()
+        agent = PlannerAgent(llm_provider=provider)
+
+        with patch.object(provider, "chat_completion", new_callable=AsyncMock) as mock:
+            mock.return_value = _make_llm_response(_sample_plan_json())
+            tool_desc = "  - nmap: Network port scanner\n  - curl: HTTP client"
+            await agent.process({
+                "goal": "scan",
+                "tools_available": ["nmap", "curl"],
+                "tool_descriptions": tool_desc,
+            })
+            call_args = mock.call_args
+            user_msg = call_args[0][0].messages[-1].content
+            assert "Network port scanner" in user_msg
+            assert "HTTP client" in user_msg
+            assert "Available tools:" in user_msg
+
+    @pytest.mark.asyncio
     async def test_passes_context(self) -> None:
         provider = _make_provider()
         agent = PlannerAgent(llm_provider=provider)

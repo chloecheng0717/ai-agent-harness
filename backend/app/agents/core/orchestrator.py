@@ -180,6 +180,21 @@ class Orchestrator:
         """Convert the current message history to LLM-compatible messages."""
         return [ChatMessage(role=m.role, content=m.content) for m in state.messages]
 
+    def _format_tool_descriptions(self, tool_names: List[str]) -> str:
+        """Build a formatted string of tool names with descriptions from the registry."""
+        if not tool_names:
+            return "none"
+        if self.tool_registry is None:
+            return ", ".join(tool_names)
+        parts: List[str] = []
+        for name in tool_names:
+            defn = self.tool_registry.get_tool_definition(name)
+            if defn and defn.description:
+                parts.append(f"  - {name}: {defn.description}")
+            else:
+                parts.append(f"  - {name}")
+        return "\n".join(parts)
+
     def _plan_context(self, state: AgentState) -> str:
         """Build extra context string for the PlannerAgent."""
         parts: List[str] = []
@@ -512,11 +527,13 @@ class Orchestrator:
             return state
 
         # ── PlannerAgent path ─────────────────────────────────
+        tools_desc = self._format_tool_descriptions(state.tools_available)
         if self.planner is not None:
             try:
                 result = await self.planner.process({
                     "goal": state.goal,
                     "tools_available": state.tools_available,
+                    "tool_descriptions": tools_desc,
                     "context": self._plan_context(state),
                 })
                 if result["success"] and result["plan"]:
@@ -549,11 +566,11 @@ class Orchestrator:
 
         # ── LLM orchestrator path ─────────────────────────────
         if self.llm_provider is not None:
-            tools_desc = ", ".join(state.tools_available) if state.tools_available else "none"
             messages = [
                 self._build_system_message(
                     "You are a planning agent. Given a goal, produce a numbered "
-                    f"execution plan. Available tools: {tools_desc}. "
+                    "execution plan.\n\n"
+                    f"Available tools:\n{tools_desc}\n\n"
                     "Reply with a JSON array of objects, each having 'index' (int), "
                     "'description' (str), 'tool_name' (str or null), and "
                     "'rationale' (str). Reply ONLY with the JSON array."

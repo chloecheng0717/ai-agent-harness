@@ -159,10 +159,11 @@ class PrintingOrchestrator(Orchestrator):
 
         # Custom plan generation that handles markdown-wrapped JSON
         # (the base orchestrator's json.loads chokes on ```json ... ```)
-        tools_desc = ", ".join(state.tools_available)
+        tools_desc = self._format_tool_descriptions(state.tools_available)
         system_msg = self._build_system_message(
             "You are a planning agent. Given a goal, produce a numbered "
-            f"execution plan. Available tools: {tools_desc}. "
+            "execution plan.\n\n"
+            f"Available tools:\n{tools_desc}\n\n"
             "Reply with a JSON array of objects, each having 'index' (int), "
             "'description' (str), 'tool_name' (str or null), and "
             "'rationale' (str). "

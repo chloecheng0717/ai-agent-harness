@@ -128,6 +128,7 @@ class PlannerAgent(BaseAgent):
         input_data : dict
             Must contain ``"goal"`` (str).  May also contain:
             - ``"tools_available"`` (list[str])
+            - ``"tool_descriptions"`` (str) – formatted tool names with descriptions
             - ``"context"`` (str) – extra context for the LLM
             - ``"previous_plan"`` (list[dict]) – for revision
             - ``"errors"`` (list[str]) – execution errors to address
@@ -140,6 +141,7 @@ class PlannerAgent(BaseAgent):
         """
         goal: str = input_data.get("goal", "")
         tools_available: List[str] = input_data.get("tools_available", [])
+        tool_descriptions: str = input_data.get("tool_descriptions", "")
         context: str = input_data.get("context", "")
         previous_plan: Optional[List[Dict[str, Any]]] = input_data.get("previous_plan")
         errors: List[str] = input_data.get("errors", [])
@@ -158,7 +160,7 @@ class PlannerAgent(BaseAgent):
             if self.memory_manager:
                 enriched_context = await self._enrich_with_memory(goal, context)
             self.logger.info("Generating new plan", goal=goal)
-            steps = await self._plan_from_llm(goal, tools_available, enriched_context)
+            steps = await self._plan_from_llm(goal, tools_available, enriched_context, tool_descriptions)
 
         # Validate
         validation_errors = self.validate_plan(steps)
@@ -255,6 +257,7 @@ class PlannerAgent(BaseAgent):
         goal: str,
         tools_available: List[str],
         context: str = "",
+        tool_descriptions: str = "",
     ) -> List[PlanStep]:
         """
         Ask the LLM to generate a plan for the given goal.
@@ -266,8 +269,11 @@ class PlannerAgent(BaseAgent):
             self.logger.info("No LLM provider, using template plan")
             return self._plan_from_template(goal)
 
-        tools_desc = ", ".join(tools_available) if tools_available else "none available"
-        user_content = f"Goal: {goal}\n\nAvailable tools: {tools_desc}"
+        if tool_descriptions:
+            tools_section = tool_descriptions
+        else:
+            tools_section = ", ".join(tools_available) if tools_available else "none available"
+        user_content = f"Goal: {goal}\n\nAvailable tools:\n{tools_section}"
         if context:
             user_content += f"\n\nAdditional context: {context}"
 
