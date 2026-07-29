@@ -14,6 +14,7 @@ with structured logging, exception handling, and retry support.
 """
 
 import asyncio
+import json
 import time
 from typing import TYPE_CHECKING, Any, Callable, Coroutine, Dict, List, Optional
 
@@ -847,7 +848,7 @@ class Orchestrator:
         """
         if self.llm_provider is not None:
             results_text = "\n".join(
-                r.get("output", "") for r in state.results if r.get("output")
+                self._format_result_output(r) for r in state.results
             )
             messages = [
                 self._build_system_message(
@@ -892,13 +893,52 @@ class Orchestrator:
         return state
 
     @staticmethod
+    def _format_result_output(r: Dict[str, Any]) -> str:
+        """Extract a readable summary from a single result dict.
+
+        Tool outputs are often structured dicts (e.g. ``{"stdout": ...}``,
+        ``{"strings": [...]}``).  This method pulls out the meaningful
+        fields rather than ``str()``-dumping the whole dict.
+        """
+        output = r.get("output")
+        step_label = f"Step {r.get('step_index', '?')}"
+        if r.get("tool_name"):
+            step_label += f" ({r['tool_name']})"
+        if not output:
+            return f"{step_label}: (no output)"
+        if isinstance(output, str):
+            return f"{step_label}: {output[:500]}"
+        if isinstance(output, dict):
+            # Known tool output shapes
+            if "stdout" in output:
+                text = output["stdout"]
+                if len(text) > 500:
+                    text = text[:500] + "..."
+                return f"{step_label}: {text}"
+            if "strings" in output:
+                items = output["strings"]
+                if items:
+                    text = "\n".join(items)
+                    if len(text) > 500:
+                        text = text[:500] + "..."
+                    return f"{step_label} ({len(items)} strings):\n{text}"
+                return f"{step_label}: (no strings found)"
+            if "mime_type" in output:
+                return f"{step_label}: {output['mime_type']} ({output.get('description', '')})"
+            if "decoded" in output or "encoded" in output:
+                return f"{step_label}: decoded={output.get('decoded', '')!r}  encoded={output.get('encoded', '')!r}"
+            # Generic dict fallback
+            return f"{step_label}: {json.dumps(output, default=str)[:500]}"
+        return f"{step_label}: {str(output)[:500]}"
+
+    @staticmethod
     def _fallback_answer(state: AgentState) -> str:
-        """Build a fallback answer by concatenating result outputs."""
+        """Build a fallback answer by concatenating formatted result outputs."""
         parts: List[str] = []
         for r in state.results:
-            output = r.get("output")
-            if output:
-                parts.append(str(output))
+            formatted = Orchestrator._format_result_output(r)
+            if formatted:
+                parts.append(formatted)
         return "\n".join(parts) if parts else "No result produced."
 
     # ── backwards-compatible entry point ─────────────────────
