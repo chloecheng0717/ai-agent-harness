@@ -21,7 +21,7 @@ import os
 import sys
 import tempfile
 import traceback
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
 # Allow imports from the backend package
@@ -113,8 +113,9 @@ class PrintingOrchestrator(Orchestrator):
     """Orchestrator that prints every lifecycle step in detail.
 
     - Intercepts LLM calls to print prompts + responses
-    - Injects sensible ``tool_parameters`` into plan steps (the base
-      Orchestrator's ``create_plan`` doesn't populate them)
+    - Has the LLM generate each step's ``tool_parameters`` directly
+      (real code for ``python``, ``input``/``mode`` for ``encoding``,
+      etc.) as part of the plan JSON, using the tool parameter schemas
     - Prints every tool invocation together with its output
     - Scans all text with ``FlagDetector``
     """
@@ -122,13 +123,38 @@ class PrintingOrchestrator(Orchestrator):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self.detector = FlagDetector()
-        # -- param injection table ------------------------------
-        self._param_template: Dict[str, Dict[str, Any]] = {
-            "file": {"path": "/workspace/challenge.txt"},
-            "strings": {"path": "/workspace/challenge.txt", "min_length": 4},
-            "python": {"code": "print(open('/workspace/challenge.txt').read())"},
-            "encoding": {},
-        }
+
+    # -- tool descriptions: include parameter schemas ----------
+
+    def _format_tool_descriptions(self, tool_names: List[str]) -> str:
+        """Format tool names, descriptions, and parameter schemas.
+
+        The extra parameter detail lets the LLM author correct, tool-
+        specific ``tool_parameters`` for each plan step (instead of a
+        hardcoded template being injected later).
+        """
+        parts: List[str] = []
+        for name in tool_names:
+            defn = self.tool_registry.get_tool_definition(name) if self.tool_registry else None
+            if defn and defn.description:
+                parts.append(f"  - {name}: {defn.description}")
+            else:
+                parts.append(f"  - {name}")
+            if defn and defn.parameters:
+                schema = defn.parameters
+                props = schema.get("properties", {})
+                required = set(schema.get("required", []))
+                for pname, pmeta in props.items():
+                    ptype = pmeta.get("type", "any")
+                    enums = pmeta.get("enum")
+                    suffix = " | ".join(enums) if enums else ptype
+                    flag = "(required)" if pname in required else ""
+                    note = pmeta.get("description", "")
+                    line = f"      {pname} ({suffix}) {flag}"
+                    if note:
+                        line += f" -- {note}"
+                    parts.append(line.rstrip())
+        return "\n".join(parts)
 
     # -- LLM interceptor ----------------------------------------
 
@@ -148,7 +174,7 @@ class PrintingOrchestrator(Orchestrator):
         print(f"  [ASSISTANT] {trunc(response, 600)}")
         return response
 
-    # -- create_plan: strip markdown, inject tool_parameters ----
+    # -- create_plan: strip markdown, parse LLM tool_parameters -
 
     async def create_plan(self, state: AgentState) -> AgentState:
         subheading("Creating plan via LLM ...")
@@ -159,14 +185,23 @@ class PrintingOrchestrator(Orchestrator):
 
         # Custom plan generation that handles markdown-wrapped JSON
         # (the base orchestrator's json.loads chokes on ```json ... ```)
+        # and asks the LLM to author each step's tool_parameters.
         tools_desc = self._format_tool_descriptions(state.tools_available)
         system_msg = self._build_system_message(
             "You are a planning agent. Given a goal, produce a numbered "
             "execution plan.\n\n"
             f"Available tools:\n{tools_desc}\n\n"
             "Reply with a JSON array of objects, each having 'index' (int), "
-            "'description' (str), 'tool_name' (str or null), and "
-            "'rationale' (str). "
+            "'description' (str), 'tool_name' (str or null), "
+            "'rationale' (str), and 'tool_parameters' (object). "
+            "'tool_parameters' must contain the exact arguments that tool "
+            "needs for THIS specific step -- e.g. for 'python' provide the "
+            "real Python 'code' (or 'script_path') that performs that step "
+            "(reading the file, decoding base64, extracting a zip, etc.); "
+            "for 'encoding' provide 'input', 'encoding' ('base64'/'hex'/"
+            "'url'), and 'mode' ('encode'/'decode'/'auto'); for 'file' or "
+            "'strings' provide 'path' or 'content'. Never guess or pad "
+            "placeholders. Use {} when the step needs no tool. "
             "Reply with RAW JSON only -- no markdown, no code fences."
         )
         user_msg = ChatMessage(role="user", content=f"Goal: {state.goal}\n\n{self._plan_context(state)}".strip())
@@ -191,6 +226,7 @@ class PrintingOrchestrator(Orchestrator):
                         description=item.get("description", f"Step {i}"),
                         tool_name=item.get("tool_name"),
                         rationale=item.get("rationale", ""),
+                        tool_parameters=item.get("tool_parameters", {}),
                     )
                     for i, item in enumerate(plan_data)
                 ]
@@ -199,17 +235,10 @@ class PrintingOrchestrator(Orchestrator):
             self.logger.warning("Custom plan parsing failed, falling back", exc_info=True)
             state = await super().create_plan(state)
 
-        # Inject tool_parameters from template
-        for ps in state.plan:
-            if ps.tool_name and not ps.tool_parameters:
-                injection = self._param_template.get(ps.tool_name, {})
-                if injection:
-                    ps.tool_parameters = dict(injection)
-
         return self._print_plan(state)
 
     def _print_plan(self, state: AgentState) -> AgentState:
-        heading("PLAN (post-LLM, with injected parameters)")
+        heading("PLAN (post-LLM, with LLM-authored parameters)")
         for ps in state.plan:
             print(f"  Step {ps.index}: {ps.description}")
             print(f"    tool:   {ps.tool_name}")
