@@ -434,6 +434,44 @@ class TestBenchmarkRunnerPassesChallenges:
         assert result.final_answer == challenge.expected_flag
 
     @pytest.mark.asyncio
+    async def test_flag_saved_to_workspace_file_passes(self, workspace_dir: str) -> None:
+        challenge = get_challenge("encoding_base64")
+        plan = [
+            {
+                "index": 0,
+                "description": "Decode the base64 message and save the flag",
+                "tool_name": "python",
+                "rationale": "Decode the message and persist the result as a workspace file.",
+                "tool_parameters": {
+                    "code": (
+                        "import base64\n"
+                        "data = open('/workspace/message.txt').read().strip()\n"
+                        "open('/workspace/flag.txt', 'w').write("
+                        "base64.b64decode(data).decode())\n"
+                        "print('saved')\n"
+                    )
+                },
+            },
+        ]
+        sandbox = _make_sandbox(workspace_dir)
+        runner = BenchmarkRunner(
+            settings=None,
+            sandbox=sandbox,
+            llm_provider=_StubProvider(plan),
+            max_iterations=1,
+        )
+
+        with _patched_client(sandbox):
+            result: ChallengeResult = await runner.run_challenge(challenge)
+
+        assert result.passed is True, result.errors
+        assert result.flag_found is True
+        assert result.status == "completed"
+        assert result.failed_step is None
+        assert [m["passed"] for m in result.milestones] == [True, True, True]
+        assert "python" in result.tools_used
+
+    @pytest.mark.asyncio
     async def test_failed_run_reports_first_failed_milestone(
         self, workspace_dir: str
     ) -> None:

@@ -169,6 +169,7 @@ class BenchmarkRunner:
 
         trace = RunTrace(
             tool_calls=result.get("benchmark_trace", []),
+            workspace_files=result.get("benchmark_workspace_files", []),
             final_answer=result.get("final_answer") or "",
             errors=result.get("errors", []),
             status=result.get("status", ""),

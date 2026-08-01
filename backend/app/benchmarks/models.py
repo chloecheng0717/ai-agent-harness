@@ -35,8 +35,13 @@ class RunTrace:
     tool_calls : list[dict]
         One entry per executed plan step: ``step_index``, ``description``,
         ``tool_name``, ``success``, ``output``, ``error``.
+    workspace_files : list[dict]
+        Verified workspace files produced during execution (``path``,
+        ``bytes``, ``content``).  Challenge seed files injected before the
+        run are excluded.  See ``BenchmarkOrchestrator._snapshot_workspace``.
     final_answer : str
-        The agent's final synthesized answer.
+        The agent's final synthesized answer.  Deliberately NOT treated as
+        pass/fail evidence — it is LLM-authored text.
     errors : list[str]
         Errors recorded during the run.
     status : str
@@ -48,15 +53,16 @@ class RunTrace:
     """
 
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
+    workspace_files: list[dict[str, Any]] = field(default_factory=list)
     final_answer: str = ""
     errors: list[str] = field(default_factory=list)
     status: str = ""
     iterations: int = 0
     execution_time_ms: float = 0.0
 
-    def all_text(self) -> str:
-        """Concatenate every string-bearing piece of evidence."""
-        parts: list[str] = [self.final_answer or ""]
+    def tool_output_text(self) -> str:
+        """Concatenate every real tool-execution output/error string."""
+        parts: list[str] = []
         for call in self.tool_calls:
             output = call.get("output")
             if isinstance(output, str):
@@ -65,14 +71,49 @@ class RunTrace:
                 parts.append(json.dumps(output, default=str))
             if call.get("error"):
                 parts.append(str(call["error"]))
+        return "\n".join(parts)
+
+    def workspace_evidence_text(self) -> str:
+        """Concatenate the contents of verified execution workspace files."""
+        parts: list[str] = []
+        for entry in self.workspace_files:
+            content = entry.get("content")
+            if isinstance(content, str):
+                parts.append(content)
+            elif content is not None:
+                parts.append(json.dumps(content, default=str))
+        return "\n".join(parts)
+
+    def execution_text(self) -> str:
+        """
+        Concatenate all REAL execution evidence: tool execution output and
+        errors, run errors, and verified workspace file contents.
+
+        LLM-authored text (``final_answer``, planner output, reasoning, or
+        explanations) is deliberately excluded from this string.
+        """
+        parts = [self.tool_output_text(), self.workspace_evidence_text()]
         parts.extend(self.errors or [])
         return "\n".join(parts)
 
+    def all_text(self) -> str:
+        """Concatenate every string-bearing piece of evidence."""
+        parts = [self.execution_text()]
+        if self.final_answer:
+            parts.append(self.final_answer)
+        return "\n".join(parts)
+
     def contains_flag(self, expected_flag: str) -> bool:
-        """Whether *expected_flag* appears anywhere in the evidence."""
+        """
+        Whether *expected_flag* appears in REAL execution evidence: tool
+        execution output, verified workspace files, or execution errors.
+
+        A flag that only appears in the ``final_answer`` (or any other
+        LLM-authored text) does NOT count as discovered.
+        """
         if not expected_flag:
             return False
-        return expected_flag.lower() in self.all_text().lower()
+        return expected_flag.lower() in self.execution_text().lower()
 
     def has_tool(self, *names: str, success: bool | None = None) -> bool:
         """Whether any call used one of *names* (optionally filtering by success)."""
@@ -133,7 +174,9 @@ class Challenge:
     goal : str
         The task description handed to the agent verbatim.
     expected_flag : str
-        Ground-truth flag.  A run passes iff this appears in the evidence.
+        Ground-truth flag.  A run passes iff this appears in real
+        execution evidence (tool output, verified workspace files, or
+        execution errors) — never in the final answer or other LLM text.
     required_capabilities : list[str]
         Tool names the agent is allowed to use.
     files : dict[str, bytes]
@@ -212,7 +255,9 @@ def evaluate_challenge(
     -------
     (passed, flag_found, milestone_results, failed_step)
 
-    * ``passed`` — the expected flag appeared in the evidence.
+    * ``passed`` — the expected flag appeared in REAL execution evidence
+      (tool output, verified workspace files, or execution errors).  The
+      ``final_answer`` is never considered evidence.
     * ``flag_found`` — same as ``passed`` but kept explicit.
     * ``milestone_results`` — ``[{"name", "passed"}]`` for diagnostics.
     * ``failed_step`` — first milestone not demonstrated, or ``None`` when

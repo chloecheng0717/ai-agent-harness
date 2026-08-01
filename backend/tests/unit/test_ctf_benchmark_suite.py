@@ -173,9 +173,31 @@ class TestChallengeRegistry:
 
 
 class TestRunTrace:
-    def test_contains_flag_case_insensitive(self) -> None:
-        trace = RunTrace(final_answer="the answer is FLAG{Upper}")
+    def test_contains_flag_uses_execution_evidence_only(self) -> None:
+        trace = RunTrace(
+            tool_calls=[
+                {
+                    "tool_name": "python",
+                    "success": True,
+                    "output": "decoded: FLAG{Upper}",
+                }
+            ],
+            final_answer="the answer is FLAG{Upper}",
+        )
         assert trace.contains_flag("flag{upper}")
+        assert not trace.contains_flag("flag{nope}")
+
+    def test_final_answer_not_counted_as_evidence(self) -> None:
+        trace = RunTrace(final_answer="the flag is flag{guess}")
+        assert not trace.contains_flag("flag{guess}")
+
+    def test_workspace_files_count_as_evidence(self) -> None:
+        trace = RunTrace(
+            workspace_files=[
+                {"path": "flag.txt", "bytes": 13, "content": "flag{saved}"}
+            ]
+        )
+        assert trace.contains_flag("flag{saved}")
         assert not trace.contains_flag("flag{nope}")
 
     def test_all_text_collects_outputs_and_errors(self) -> None:
@@ -184,12 +206,14 @@ class TestRunTrace:
                 {"tool_name": "python", "success": True, "output": "hello"},
                 {"tool_name": "strings", "success": False, "error": "boom"},
             ],
+            workspace_files=[{"path": "a.txt", "content": "extra"}],
             errors=["top-level error"],
         )
         text = trace.all_text()
         assert "hello" in text
         assert "boom" in text
         assert "top-level error" in text
+        assert "extra" in text
 
     def test_has_and_count_tool_with_success_filter(self) -> None:
         trace = RunTrace(
@@ -211,14 +235,14 @@ class TestRunTrace:
 
 
 class TestEvaluateChallenge:
-    def test_flag_in_final_answer_passes_and_clears_failed_step(self) -> None:
+    def test_flag_in_final_answer_only_fails(self) -> None:
         challenge = get_challenge("encoding_base64")
         trace = RunTrace(final_answer=challenge.expected_flag)
         passed, flag_found, milestones, failed_step = evaluate_challenge(challenge, trace)
-        assert passed is True
-        assert flag_found is True
-        assert all(m["passed"] for m in milestones)
-        assert failed_step is None
+        assert passed is False
+        assert flag_found is False
+        assert not all(m["passed"] for m in milestones)
+        assert failed_step is not None
 
     def test_flag_in_tool_output_alone_passes(self) -> None:
         challenge = get_challenge("encoding_base64")
@@ -234,7 +258,42 @@ class TestEvaluateChallenge:
         )
         passed, flag_found, _, failed_step = evaluate_challenge(challenge, trace)
         assert passed is True
+        assert flag_found is True
         assert failed_step is None
+
+    def test_flag_in_workspace_file_alone_passes(self) -> None:
+        challenge = get_challenge("encoding_base64")
+        trace = RunTrace(
+            workspace_files=[
+                {
+                    "path": "flag.txt",
+                    "bytes": len(challenge.expected_flag),
+                    "content": challenge.expected_flag,
+                }
+            ]
+        )
+        passed, flag_found, milestones, failed_step = evaluate_challenge(challenge, trace)
+        assert passed is True
+        assert flag_found is True
+        assert all(m["passed"] for m in milestones)
+        assert failed_step is None
+
+    def test_flag_in_planner_description_not_evidence(self) -> None:
+        challenge = get_challenge("encoding_base64")
+        trace = RunTrace(
+            tool_calls=[
+                {
+                    "step_index": 0,
+                    "description": f"plan mentions {challenge.expected_flag}",
+                    "tool_name": "python",
+                    "success": True,
+                    "output": "no flag here",
+                }
+            ]
+        )
+        passed, flag_found, _, _ = evaluate_challenge(challenge, trace)
+        assert passed is False
+        assert flag_found is False
 
     def test_partial_evidence_reports_first_failed_milestone(self) -> None:
         challenge = get_challenge("encoding_base64")

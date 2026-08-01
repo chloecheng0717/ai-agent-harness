@@ -18,6 +18,7 @@ No new tools are introduced and the underlying lifecycle is untouched.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from typing import Any
 
@@ -58,7 +59,12 @@ class BenchmarkOrchestrator(Orchestrator):
         # Captured benchmark evidence (see :meth:`run`).
         self.benchmark_tool_calls: list[dict[str, Any]] = []
         self.benchmark_plan: list[dict[str, Any]] = []
+        self.benchmark_workspace_files: list[dict[str, Any]] = []
         self.benchmark_iterations: int = 0
+
+        # Relative path -> sha256 of each challenge seed file, used to tell
+        # execution-produced workspace files apart from injected inputs.
+        self._baseline_files: dict[str, str] = {}
 
     # ── workspace: inject challenge files ───────────────────────
 
@@ -83,7 +89,57 @@ class BenchmarkOrchestrator(Orchestrator):
                 path=rel_path,
                 bytes=len(raw),
             )
+
+        self._baseline_files = {
+            rel_path.lstrip("/\\").replace("\\", "/"): hashlib.sha256(
+                content.encode("utf-8") if isinstance(content, str) else content
+            ).hexdigest()
+            for rel_path, content in self.challenge_files.items()
+        }
         return workspace_id
+
+    # ── workspace: capture execution-produced files ─────────────
+
+    def _snapshot_workspace(self, workspace_id: str | None) -> None:
+        """
+        Record verified workspace files produced during execution.
+
+        Every file in the run workspace whose content differs from the
+        injected challenge seed files is captured (path, size, content).
+        These are real execution artifacts: anything a tool wrote,
+        extracted, decoded, or modified while the run was executing.
+        """
+        if workspace_id is None or self.sandbox is None:
+            return
+        workspace = self.sandbox.get_workspace(workspace_id)
+        if workspace is None:
+            return
+        host = workspace.host_path
+        if not host.is_dir():
+            return
+
+        for path in sorted(host.rglob("*")):
+            if not path.is_file():
+                continue
+            rel = path.relative_to(host).as_posix()
+            try:
+                data = path.read_bytes()
+            except OSError:
+                continue
+            if self._baseline_files.get(rel) == hashlib.sha256(data).hexdigest():
+                continue
+            self.benchmark_workspace_files.append(
+                {
+                    "path": rel,
+                    "bytes": len(data),
+                    "content": data.decode("utf-8", errors="replace"),
+                }
+            )
+
+    def _cleanup_workspace(self, workspace_id: str | None) -> None:
+        """Snapshot execution-produced workspace files before removal."""
+        self._snapshot_workspace(workspace_id)
+        super()._cleanup_workspace(workspace_id)
 
     # ── planning with LLM-authored tool parameters ──────────────
 
@@ -234,6 +290,7 @@ class BenchmarkOrchestrator(Orchestrator):
         result = await super().run(task_id, task_data, tools_available)
         result["benchmark_trace"] = self.benchmark_tool_calls
         result["benchmark_plan"] = self.benchmark_plan
+        result["benchmark_workspace_files"] = self.benchmark_workspace_files
         result["iterations"] = self.benchmark_iterations
         if self.verbose:
             print(
