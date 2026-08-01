@@ -5,7 +5,7 @@ Extracts printable strings from a target file or buffer using the
 ``strings`` command inside a Docker sandbox.
 """
 
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import structlog
 
@@ -19,6 +19,9 @@ from app.models.tool import (
 )
 from app.sandbox.docker_sandbox import DockerSandbox
 from app.tools.base import BaseTool
+
+if TYPE_CHECKING:
+    from app.sandbox.workspace import Workspace
 
 # Maximum number of strings to return before truncation kicks in.
 MAX_STRINGS: int = 5000
@@ -84,7 +87,11 @@ class StringsTool(BaseTool):
         self.sandbox = sandbox
         self.logger = structlog.get_logger().bind(component="strings_tool")
 
-    async def execute(self, parameters: Dict[str, Any]) -> ToolResult:
+    async def execute(
+        self,
+        parameters: Dict[str, Any],
+        workspace: Optional["Workspace"] = None,
+    ) -> ToolResult:
         path: Optional[str] = parameters.get("path")
         content: Optional[str] = parameters.get("content")
         min_length: int = parameters.get("min_length", 4)
@@ -100,9 +107,10 @@ class StringsTool(BaseTool):
         target: str = ""
 
         if content is not None:
-            workspace_id = "stringstool-temp"
             files = {"_st_target": content}
             target = "/workspace/_st_target"
+            if workspace is None:
+                workspace_id = "stringstool-temp"
         else:
             target = path  # type: ignore[assignment]
 
@@ -112,6 +120,7 @@ class StringsTool(BaseTool):
             result = await self.sandbox.execute(
                 cmd,
                 workspace_id=workspace_id,
+                workspace=workspace,
                 files=files,
             )
         except Exception as exc:

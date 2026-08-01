@@ -6,7 +6,7 @@ Runs the actual work inside a Docker sandbox for safety.
 """
 
 import re
-from typing import Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
 import structlog
 
@@ -20,6 +20,9 @@ from app.models.tool import (
 )
 from app.sandbox.docker_sandbox import DockerSandbox
 from app.tools.base import BaseTool
+
+if TYPE_CHECKING:
+    from app.sandbox.workspace import Workspace
 
 # Supported encoding families
 _VALID_ENCODINGS = {"base64", "hex", "url"}
@@ -203,7 +206,11 @@ class EncodingTool(BaseTool):
 
     # -- execute ---------------------------------------------------
 
-    async def execute(self, parameters: Dict[str, Any]) -> ToolResult:
+    async def execute(
+        self,
+        parameters: Dict[str, Any],
+        workspace: Optional["Workspace"] = None,
+    ) -> ToolResult:
         data: str = parameters.get("input", "")
         encoding: str = parameters.get("encoding", "")
         mode_param: str = parameters.get("mode", "auto")
@@ -235,6 +242,7 @@ class EncodingTool(BaseTool):
         try:
             result = await self.sandbox.execute(
                 f"python -c '{python_snippet}'",
+                workspace=workspace,
             )
         except Exception as exc:
             self.logger.error("encoding execution failed", error=str(exc))

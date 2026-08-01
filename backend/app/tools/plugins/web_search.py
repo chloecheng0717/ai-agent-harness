@@ -5,7 +5,7 @@ A placeholder tool that performs web searches.
 This is a simple example to demonstrate the tool framework.
 """
 
-from typing import Any, Dict, List
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import structlog
 
@@ -18,6 +18,9 @@ from app.models.tool import (
     ToolResult,
 )
 from app.tools.base import BaseTool
+
+if TYPE_CHECKING:
+    from app.sandbox.workspace import Workspace
 
 
 class WebSearchTool(BaseTool):
@@ -90,13 +93,18 @@ class WebSearchTool(BaseTool):
         super().__init__(definition)
         self.logger = structlog.get_logger().bind(component="web_search_tool")
     
-    async def execute(self, parameters: Dict[str, Any]) -> ToolResult:
+    async def execute(
+        self,
+        parameters: Dict[str, Any],
+        workspace: Optional["Workspace"] = None,
+    ) -> ToolResult:
         """
         Execute the web search tool.
-        
+
         Args:
             parameters: Must contain 'query' key
-            
+            workspace: Persistent shared workspace for the run (unused).
+
         Returns:
             ToolResult with search results
         """

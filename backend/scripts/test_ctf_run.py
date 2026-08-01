@@ -277,6 +277,7 @@ class PrintingOrchestrator(Orchestrator):
                     ToolPermission.NETWORK,
                     ToolPermission.FILE_SYSTEM,
                 ],
+                workspace_id=state.metadata.get("workspace_id"),
             )
             state.tools_used.append(plan_step.tool_name)
 
@@ -423,6 +424,7 @@ async def main() -> int:
     orch = PrintingOrchestrator(
         llm_provider=llm_provider,
         tool_registry=registry,
+        sandbox=sandbox,
     )
     print("  Orchestrator ready")
 

@@ -11,9 +11,11 @@ from app.sandbox.docker_sandbox import (
     SandboxConfig,
     SandboxExecutionResult,
 )
+from app.sandbox.workspace import Workspace
 
 __all__ = [
     "DockerSandbox",
     "SandboxConfig",
     "SandboxExecutionResult",
+    "Workspace",
 ]

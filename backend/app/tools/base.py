@@ -6,7 +6,7 @@ Tools are plugins that agents can use to interact with external systems.
 """
 
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import structlog
 
@@ -18,6 +18,9 @@ from app.models.tool import (
     ToolPermission,
     ToolResult,
 )
+
+if TYPE_CHECKING:
+    from app.sandbox.workspace import Workspace
 
 
 class BaseTool(ABC):
@@ -85,16 +88,24 @@ class BaseTool(ABC):
         return self.definition.sandbox_capability
     
     @abstractmethod
-    async def execute(self, parameters: Dict[str, Any]) -> ToolResult:
+    async def execute(
+        self,
+        parameters: Dict[str, Any],
+        workspace: Optional["Workspace"] = None,
+    ) -> ToolResult:
         """
         Execute the tool with given parameters.
-        
+
         This is the main method that tools must implement.
         It receives parameters, performs the operation, and returns results.
-        
+
         Args:
             parameters: Tool parameters matching the definition schema
-            
+            workspace: Optional persistent shared workspace for the
+                current agent execution run.  All tool calls within one
+                run receive the same workspace so files persist between
+                calls.
+
         Returns:
             ToolResult with success status, output, and metadata
         """

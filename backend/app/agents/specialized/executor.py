@@ -31,6 +31,7 @@ from app.models.tool import ToolExecutionRequest, ToolPermission
 if TYPE_CHECKING:
     from app.tools.registry import ToolRegistry
     from app.memory.manager import MemoryManager
+    from app.sandbox.docker_sandbox import DockerSandbox
 
 
 # ── Constants ────────────────────────────────────────────────────
@@ -87,6 +88,7 @@ class ExecutorAgent(BaseAgent):
         max_retries: int = DEFAULT_MAX_RETRIES,
         default_timeout: int = DEFAULT_STEP_TIMEOUT,
         memory_manager: Optional["MemoryManager"] = None,
+        sandbox: Optional["DockerSandbox"] = None,
     ) -> None:
         if config is None:
             config = AgentConfig(
@@ -100,6 +102,7 @@ class ExecutorAgent(BaseAgent):
         self.default_timeout = default_timeout
         self.execution_history: List[ExecutionRecord] = []
         self.memory_manager = memory_manager
+        self.sandbox = sandbox
         self.logger = self.logger.bind(component="executor_agent")
 
     # ── BaseAgent interface ───────────────────────────────────
@@ -135,18 +138,26 @@ class ExecutorAgent(BaseAgent):
             input_data.get("tool_registry") or self.tool_registry
         )
 
+        # Create one persistent workspace for this entire execution run.
+        # Every tool call within the run shares the same sandbox directory,
+        # so files written by one tool are visible to later tool calls.
+        workspace_id: Optional[str] = self._create_workspace()
+
         try:
-            results, errors, tools_used, records = await self._execute_plan(
-                state.plan, registry
-            )
-        except DependencyResolutionError as exc:
-            return {
-                "success": False,
-                "results": [],
-                "errors": [str(exc)],
-                "tools_used": [],
-                "execution_history": [],
-            }
+            try:
+                results, errors, tools_used, records = await self._execute_plan(
+                    state.plan, registry, workspace_id
+                )
+            except DependencyResolutionError as exc:
+                return {
+                    "success": False,
+                    "results": [],
+                    "errors": [str(exc)],
+                    "tools_used": [],
+                    "execution_history": [],
+                }
+        finally:
+            self._cleanup_workspace(workspace_id)
 
         success = len(errors) == 0
 
@@ -297,6 +308,7 @@ class ExecutorAgent(BaseAgent):
         self,
         plan: List[PlanStep],
         registry: Optional["ToolRegistry"],
+        workspace_id: Optional[str] = None,
     ) -> tuple[
         List[ExecutionResult],
         List[str],
@@ -305,6 +317,15 @@ class ExecutorAgent(BaseAgent):
     ]:
         """
         Execute every step in dependency order.
+
+        Parameters
+        ----------
+        plan : list[PlanStep]
+            Steps to execute, resolved into dependency order.
+        registry : ToolRegistry | None
+            Tool registry for tool invocations.
+        workspace_id : str | None
+            ID of the persistent workspace shared by all tool calls in this run.
 
         Returns
         -------
@@ -348,7 +369,9 @@ class ExecutorAgent(BaseAgent):
             record.mark_started()
             records.append(record)
 
-            step_result = await self._execute_step(step, registry, record)
+            step_result = await self._execute_step(
+                step, registry, record, workspace_id
+            )
 
             results.append(step_result)
 
@@ -386,6 +409,7 @@ class ExecutorAgent(BaseAgent):
         step: PlanStep,
         registry: Optional["ToolRegistry"],
         record: ExecutionRecord,
+        workspace_id: Optional[str] = None,
     ) -> ExecutionResult:
         """
         Execute a single plan step with retry and timeout.
@@ -398,6 +422,8 @@ class ExecutorAgent(BaseAgent):
             Tool registry for tool invocations.
         record : ExecutionRecord
             Execution record to update on retry.
+        workspace_id : str | None
+            ID of the persistent workspace shared by all tool calls in this run.
 
         Returns
         -------
@@ -417,7 +443,7 @@ class ExecutorAgent(BaseAgent):
             try:
                 if step.tool_name:
                     result = await self._execute_tool_step(
-                        step, registry, timeout
+                        step, registry, timeout, workspace_id
                     )
                 else:
                     result = await self._execute_reasoning_step(step)
@@ -517,6 +543,7 @@ class ExecutorAgent(BaseAgent):
         step: PlanStep,
         registry: Optional["ToolRegistry"],
         timeout: int,
+        workspace_id: Optional[str] = None,
     ) -> ExecutionResult:
         """Execute a plan step that invokes a tool."""
         if registry is None:
@@ -548,6 +575,7 @@ class ExecutorAgent(BaseAgent):
                 ToolPermission.FILE_SYSTEM,
                 ToolPermission.DATABASE,
             ],
+            workspace_id=workspace_id,
         )
 
         tool_result = await asyncio.wait_for(
@@ -578,6 +606,46 @@ class ExecutorAgent(BaseAgent):
         )
 
     # ── Helpers ───────────────────────────────────────────────
+
+    def _create_workspace(self) -> Optional[str]:
+        """
+        Create a persistent workspace for this execution run.
+
+        Returns the workspace ID, or ``None`` when no sandbox is
+        configured (tools then run with per-call temporary workspaces).
+        """
+        if self.sandbox is None:
+            return None
+        try:
+            workspace = self.sandbox.create_workspace()
+            self.logger.info(
+                "Created persistent workspace for run",
+                workspace_id=workspace.workspace_id,
+            )
+            return workspace.workspace_id
+        except Exception as exc:
+            self.logger.warning(
+                "Failed to create persistent workspace",
+                error=str(exc),
+            )
+            return None
+
+    def _cleanup_workspace(self, workspace_id: Optional[str]) -> None:
+        """Remove the persistent workspace for a finished run."""
+        if workspace_id is None or self.sandbox is None:
+            return
+        try:
+            self.sandbox.delete_workspace(workspace_id)
+            self.logger.info(
+                "Deleted persistent workspace for run",
+                workspace_id=workspace_id,
+            )
+        except Exception as exc:
+            self.logger.warning(
+                "Failed to delete persistent workspace",
+                workspace_id=workspace_id,
+                error=str(exc),
+            )
 
     async def _store_execution_results(
         self,

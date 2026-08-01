@@ -23,6 +23,8 @@ from typing import Any, Dict, List, Optional
 
 import structlog
 
+from app.sandbox.workspace import Workspace
+
 try:
     import docker
     from docker.errors import (
@@ -211,6 +213,7 @@ class DockerSandbox:
         self.config = config or SandboxConfig()
         self._client: Optional[Any] = None
         self._active_containers: Dict[str, Any] = {}
+        self._persistent_workspaces: Dict[str, Workspace] = {}
 
         self.logger = structlog.get_logger().bind(
             component="docker_sandbox",
@@ -321,6 +324,98 @@ class DockerSandbox:
 
     # ── Workspace management ───────────────────────────────────
 
+    def create_workspace(self, workspace_id: Optional[str] = None) -> Workspace:
+        """
+        Create a persistent workspace directory for an execution run.
+
+        The workspace persists across multiple :meth:`execute` calls and
+        is only removed when :meth:`delete_workspace` is invoked (typically
+        when the entire agent run finishes) or when :meth:`close` is called.
+
+        Parameters
+        ----------
+        workspace_id : str | None
+            Explicit workspace ID.  A unique ID is generated when ``None``,
+            which supports multiple concurrent runs.
+
+        Returns
+        -------
+        Workspace
+            Handle to the created workspace.
+
+        Raises
+        ------
+        WorkspaceSetupError
+            If workspace preparation fails.
+        """
+        workspace = Workspace.create(
+            base_dir=self.config.workspace_dir or tempfile.gettempdir(),
+            workspace_id=workspace_id,
+            container_path=self.config.working_dir,
+        )
+        self._persistent_workspaces[workspace.workspace_id] = workspace
+        self.logger.info(
+            "Persistent workspace created",
+            workspace_id=workspace.workspace_id,
+            path=str(workspace.host_path),
+        )
+        return workspace
+
+    def get_workspace(self, workspace_id: str) -> Optional[Workspace]:
+        """
+        Get a previously created persistent workspace by ID.
+
+        Parameters
+        ----------
+        workspace_id : str
+            Workspace ID returned by :meth:`create_workspace`.
+
+        Returns
+        -------
+        Workspace | None
+            The workspace handle, or ``None`` if it was never created.
+        """
+        return self._persistent_workspaces.get(workspace_id)
+
+    def delete_workspace(self, workspace_id: str) -> None:
+        """
+        Remove a persistent workspace directory.
+
+        Parameters
+        ----------
+        workspace_id : str
+            Workspace ID returned by :meth:`create_workspace`.
+        """
+        workspace = self._persistent_workspaces.pop(workspace_id, None)
+        if workspace is not None:
+            workspace.cleanup()
+            self.logger.info(
+                "Persistent workspace deleted",
+                workspace_id=workspace_id,
+            )
+        else:
+            self._cleanup_workspace(workspace_id)
+
+    def _write_files(
+        self,
+        workspace_path: Path,
+        files: Dict[str, str],
+    ) -> None:
+        """
+        Write the given files into an existing workspace directory.
+
+        Parameters
+        ----------
+        workspace_path : Path
+            Host-side path of the workspace directory.
+        files : dict
+            Mapping of filename -> content to create in the workspace.
+        """
+        for filename, content in files.items():
+            file_path = workspace_path / filename
+            file_path.parent.mkdir(parents=True, exist_ok=True)
+            file_path.write_text(content, encoding="utf-8")
+
     def _prepare_workspace(
         self,
         workspace_id: str,
@@ -353,10 +448,7 @@ class DockerSandbox:
             workspace_path.mkdir(parents=True, exist_ok=True)
 
             if files:
-                for filename, content in files.items():
-                    file_path = workspace_path / filename
-                    file_path.parent.mkdir(parents=True, exist_ok=True)
-                    file_path.write_text(content, encoding="utf-8")
+                self._write_files(workspace_path, files)
 
             self.logger.debug(
                 "Workspace prepared",
@@ -403,6 +495,7 @@ class DockerSandbox:
         *,
         workspace_id: Optional[str] = None,
         files: Optional[Dict[str, str]] = None,
+        workspace: Optional[Workspace] = None,
         environment: Optional[Dict[str, str]] = None,
         timeout: Optional[int] = None,
         working_dir: Optional[str] = None,
@@ -419,7 +512,12 @@ class DockerSandbox:
         workspace_id : str | None
             If provided, creates and mounts a per-task workspace.
         files : dict | None
-            Files to place in the workspace (requires ``workspace_id``).
+            Files to place in the workspace (requires ``workspace_id``
+            or ``workspace``).
+        workspace : Workspace | None
+            A persistent shared workspace to mount.  Takes precedence
+            over ``workspace_id`` and is never removed by this method —
+            the caller owns its lifecycle.
         environment : dict | None
             Extra environment variables (merged with config defaults).
         timeout : int | None
@@ -460,8 +558,14 @@ class DockerSandbox:
         )
 
         try:
-            # Prepare workspace if requested
-            if workspace_id is not None:
+            # Prepare workspace if requested. Persistent workspaces are
+            # mounted in place and owned by the caller; per-call workspaces
+            # are created fresh and cleaned up when execution finishes.
+            if workspace is not None:
+                workspace_path = workspace.host_path
+                if files:
+                    self._write_files(workspace_path, files)
+            elif workspace_id is not None:
                 workspace_path = self._prepare_workspace(workspace_id, files)
 
             # Ensure image is available
@@ -633,8 +737,10 @@ class DockerSandbox:
             if container is not None:
                 await self._cleanup_container(container, container_id)
 
-            # Cleanup workspace
-            if workspace_id is not None:
+            # Cleanup per-call workspace only. Persistent workspaces are
+            # owned by the caller (e.g. ExecutorAgent) and are removed when
+            # the entire agent execution finishes.
+            if workspace is None and workspace_id is not None:
                 if self.config.cleanup_policy == CleanupPolicy.ALWAYS:
                     self._cleanup_workspace(workspace_id)
                 elif (
@@ -722,6 +828,7 @@ class DockerSandbox:
         *,
         workspace_id: Optional[str] = None,
         files: Optional[Dict[str, str]] = None,
+        workspace: Optional[Workspace] = None,
         environment: Optional[Dict[str, str]] = None,
         timeout: Optional[int] = None,
         parallel: bool = False,
@@ -737,6 +844,8 @@ class DockerSandbox:
             Shared workspace for all commands.
         files : dict | None
             Files to place in the workspace.
+        workspace : Workspace | None
+            Persistent shared workspace for all commands.
         environment : dict | None
             Extra environment variables.
         timeout : int | None
@@ -764,6 +873,7 @@ class DockerSandbox:
                 self.execute(
                     cmd,
                     workspace_id=workspace_id,
+                    workspace=workspace,
                     files=files if i == 0 else None,
                     environment=environment,
                     timeout=timeout,
@@ -777,6 +887,7 @@ class DockerSandbox:
             result = await self.execute(
                 cmd,
                 workspace_id=workspace_id,
+                workspace=workspace,
                 files=files if i == 0 else None,
                 environment=environment,
                 timeout=timeout,
@@ -835,8 +946,10 @@ class DockerSandbox:
     # ── Lifecycle ──────────────────────────────────────────────
 
     async def close(self) -> None:
-        """Shut down the sandbox, removing all active containers."""
+        """Shut down the sandbox, removing all active containers and workspaces."""
         await self.cleanup_all()
+        for workspace_id in list(self._persistent_workspaces):
+            self.delete_workspace(workspace_id)
         self._client = None
         self.logger.info("Docker sandbox closed")
 

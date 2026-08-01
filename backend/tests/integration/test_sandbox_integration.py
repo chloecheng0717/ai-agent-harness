@@ -90,7 +90,11 @@ class SandboxBackedTool(BaseTool):
         super().__init__(definition)
         self.sandbox = sandbox
 
-    async def execute(self, parameters: Dict[str, Any]) -> ToolResult:
+    async def execute(
+        self,
+        parameters: Dict[str, Any],
+        workspace: Any = None,
+    ) -> ToolResult:
         code = parameters.get("code", "")
         timeout = parameters.get("timeout", 30)
 
@@ -99,6 +103,7 @@ class SandboxBackedTool(BaseTool):
 
         result = await self.sandbox.execute(
             f"python -c '{code}'",
+            workspace=workspace,
             timeout=timeout,
         )
 

@@ -530,6 +530,143 @@ class TestWorkspace:
             shutil.rmtree(workspace_dir, ignore_errors=True)
 
 
+# ── Persistent Workspace Tests ───────────────────────────────────
+
+
+class TestPersistentWorkspace:
+    """Tests for persistent shared workspaces (create/get/delete)."""
+
+    def test_create_workspace_creates_directory(self) -> None:
+        """Test that a persistent workspace directory is created."""
+        workspace_dir = tempfile.mkdtemp()
+        try:
+            config = SandboxConfig(workspace_dir=workspace_dir)
+            sandbox = DockerSandbox(config)
+
+            ws = sandbox.create_workspace()
+            assert ws.host_path.exists()
+            assert ws.host_path.is_dir()
+            assert ws.workspace_id.startswith("ws-")
+        finally:
+            shutil.rmtree(workspace_dir, ignore_errors=True)
+
+    def test_create_workspace_with_explicit_id(self) -> None:
+        """Test creating a persistent workspace with an explicit ID."""
+        workspace_dir = tempfile.mkdtemp()
+        try:
+            config = SandboxConfig(workspace_dir=workspace_dir)
+            sandbox = DockerSandbox(config)
+
+            ws = sandbox.create_workspace(workspace_id="my-run-1")
+            assert ws.workspace_id == "my-run-1"
+            assert ws.host_path.name == "my-run-1"
+            assert ws.host_path.exists()
+        finally:
+            shutil.rmtree(workspace_dir, ignore_errors=True)
+
+    def test_create_workspace_unique_ids(self) -> None:
+        """Test that concurrent runs get distinct workspace IDs."""
+        workspace_dir = tempfile.mkdtemp()
+        try:
+            config = SandboxConfig(workspace_dir=workspace_dir)
+            sandbox = DockerSandbox(config)
+
+            ws_a = sandbox.create_workspace()
+            ws_b = sandbox.create_workspace()
+
+            assert ws_a.workspace_id != ws_b.workspace_id
+            assert ws_a.host_path != ws_b.host_path
+            assert ws_a.host_path.exists()
+            assert ws_b.host_path.exists()
+        finally:
+            shutil.rmtree(workspace_dir, ignore_errors=True)
+
+    def test_get_workspace_returns_handle(self) -> None:
+        """Test retrieving a created persistent workspace."""
+        workspace_dir = tempfile.mkdtemp()
+        try:
+            config = SandboxConfig(workspace_dir=workspace_dir)
+            sandbox = DockerSandbox(config)
+
+            ws = sandbox.create_workspace(workspace_id="get-me")
+            assert sandbox.get_workspace("get-me") is ws
+        finally:
+            shutil.rmtree(workspace_dir, ignore_errors=True)
+
+    def test_get_workspace_unknown_returns_none(self) -> None:
+        """Test that an unknown workspace ID resolves to None."""
+        sandbox = DockerSandbox(SandboxConfig(workspace_dir=tempfile.mkdtemp()))
+        assert sandbox.get_workspace("never-created") is None
+
+    def test_delete_workspace_removes_directory(self) -> None:
+        """Test that deleting a persistent workspace removes its files."""
+        workspace_dir = tempfile.mkdtemp()
+        try:
+            config = SandboxConfig(workspace_dir=workspace_dir)
+            sandbox = DockerSandbox(config)
+
+            ws = sandbox.create_workspace(workspace_id="delete-me")
+            (ws.host_path / "artifact.txt").write_text("data", encoding="utf-8")
+            assert ws.host_path.exists()
+
+            sandbox.delete_workspace("delete-me")
+
+            assert not ws.host_path.exists()
+            assert sandbox.get_workspace("delete-me") is None
+        finally:
+            shutil.rmtree(workspace_dir, ignore_errors=True)
+
+    @pytest.mark.asyncio
+    async def test_execute_does_not_cleanup_persistent_workspace(self) -> None:
+        """Test that execute() leaves persistent workspaces untouched."""
+        workspace_dir = tempfile.mkdtemp()
+        try:
+            config = SandboxConfig(
+                workspace_dir=workspace_dir,
+                pull_policy="never",
+                cleanup_policy=CleanupPolicy.ALWAYS,
+            )
+            sandbox = DockerSandbox(config)
+            ws = sandbox.create_workspace(workspace_id="persist-run")
+
+            mock_container = _mock_container(exit_code=0)
+
+            with patch.object(sandbox, "_get_client") as mock_get_client:
+                client = _mock_docker_client(mock_container)
+                mock_get_client.return_value = client
+
+                result = await sandbox.execute(
+                    "echo hi",
+                    workspace=ws,
+                    files={"seed.txt": "seed content"},
+                )
+
+                assert result.success is True
+                # Persistent workspace survives the per-call cleanup
+                assert ws.host_path.exists()
+                assert (ws.host_path / "seed.txt").read_text() == "seed content"
+        finally:
+            shutil.rmtree(workspace_dir, ignore_errors=True)
+
+    @pytest.mark.asyncio
+    async def test_close_deletes_persistent_workspaces(self) -> None:
+        """Test that close() removes all tracked persistent workspaces."""
+        workspace_dir = tempfile.mkdtemp()
+        try:
+            config = SandboxConfig(workspace_dir=workspace_dir)
+            sandbox = DockerSandbox(config)
+
+            ws_a = sandbox.create_workspace()
+            ws_b = sandbox.create_workspace()
+
+            await sandbox.close()
+
+            assert not ws_a.host_path.exists()
+            assert not ws_b.host_path.exists()
+        finally:
+            shutil.rmtree(workspace_dir, ignore_errors=True)
+
+
 # ── Batch Execution Tests ────────────────────────────────────────
 
 

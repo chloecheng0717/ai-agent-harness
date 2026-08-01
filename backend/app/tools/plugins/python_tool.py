@@ -6,7 +6,7 @@ This is the compute/decode tool the agent reaches for when no
 specific tool fits.
 """
 
-from typing import Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
 import structlog
 
@@ -20,6 +20,9 @@ from app.models.tool import (
 )
 from app.sandbox.docker_sandbox import DockerSandbox
 from app.tools.base import BaseTool
+
+if TYPE_CHECKING:
+    from app.sandbox.workspace import Workspace
 
 # Absolute ceiling for this tool (seconds) regardless of caller request.
 _MAX_TIMEOUT: int = 120
@@ -89,7 +92,11 @@ class PythonTool(BaseTool):
         self.sandbox = sandbox
         self.logger = structlog.get_logger().bind(component="python_tool")
 
-    async def execute(self, parameters: Dict[str, Any]) -> ToolResult:
+    async def execute(
+        self,
+        parameters: Dict[str, Any],
+        workspace: Optional["Workspace"] = None,
+    ) -> ToolResult:
         code: Optional[str] = parameters.get("code")
         script_path: Optional[str] = parameters.get("script_path")
         timeout: Optional[int] = parameters.get("timeout")
@@ -116,9 +123,10 @@ class PythonTool(BaseTool):
         cmd: str = ""
 
         if code is not None:
-            workspace_id = "pythontool-temp"
             files = {"_pt_script.py": code}
             cmd = "python /workspace/_pt_script.py"
+            if workspace is None:
+                workspace_id = "pythontool-temp"
         else:
             cmd = f"python {script_path}"
 
@@ -126,6 +134,7 @@ class PythonTool(BaseTool):
             result = await self.sandbox.execute(
                 cmd,
                 workspace_id=workspace_id,
+                workspace=workspace,
                 files=files,
                 timeout=effective_timeout,
             )

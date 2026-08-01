@@ -80,7 +80,11 @@ class StubTool(BaseTool):
         self._output_value = output_value
         self._delay = delay
 
-    async def execute(self, parameters: Dict[str, Any]) -> ToolResult:
+    async def execute(
+        self,
+        parameters: Dict[str, Any],
+        workspace: Any = None,
+    ) -> ToolResult:
         if self._delay > 0:
             await asyncio.sleep(self._delay)
         if not self._should_succeed:
@@ -104,7 +108,11 @@ class FailingTool(BaseTool):
         )
         super().__init__(definition)
 
-    async def execute(self, parameters: Dict[str, Any]) -> ToolResult:
+    async def execute(
+        self,
+        parameters: Dict[str, Any],
+        workspace: Any = None,
+    ) -> ToolResult:
         raise RuntimeError("Intentional tool failure")
 
 
@@ -556,7 +564,11 @@ class TestRetryMechanism:
                     permissions=[ToolPermission.EXECUTE],
                 ))
 
-            async def execute(self, parameters: Dict[str, Any]) -> ToolResult:
+            async def execute(
+                self,
+                parameters: Dict[str, Any],
+                workspace: Any = None,
+            ) -> ToolResult:
                 nonlocal call_count
                 call_count += 1
                 if call_count < 2:

@@ -68,7 +68,11 @@ class ConcreteTestTool(BaseTool):
         )
         super().__init__(definition)
 
-    async def execute(self, parameters: Dict[str, Any]) -> ToolResult:
+    async def execute(
+        self,
+        parameters: Dict[str, Any],
+        workspace: Any = None,
+    ) -> ToolResult:
         """Execute the test tool."""
         value = parameters.get("value", "")
         return ToolResult(

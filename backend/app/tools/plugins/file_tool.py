@@ -5,7 +5,7 @@ Identifies file types using the ``file`` command inside a Docker sandbox.
 Returns structured type information including MIME type and description.
 """
 
-from typing import Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
 import structlog
 
@@ -19,6 +19,9 @@ from app.models.tool import (
 )
 from app.sandbox.docker_sandbox import DockerSandbox
 from app.tools.base import BaseTool
+
+if TYPE_CHECKING:
+    from app.sandbox.workspace import Workspace
 
 
 class FileTool(BaseTool):
@@ -88,7 +91,11 @@ class FileTool(BaseTool):
 
     # -- execute ---------------------------------------------------
 
-    async def execute(self, parameters: Dict[str, Any]) -> ToolResult:
+    async def execute(
+        self,
+        parameters: Dict[str, Any],
+        workspace: Optional["Workspace"] = None,
+    ) -> ToolResult:
         path: Optional[str] = parameters.get("path")
         content: Optional[str] = parameters.get("content")
 
@@ -103,9 +110,10 @@ class FileTool(BaseTool):
         cmd: str = ""
 
         if content is not None:
-            workspace_id = "filetool-temp"
             files = {"_ft_target": content}
             cmd = "file --mime-type -b /workspace/_ft_target"
+            if workspace is None:
+                workspace_id = "filetool-temp"
         else:
             cmd = f"file --mime-type -b {path}"
 
@@ -113,6 +121,7 @@ class FileTool(BaseTool):
             result = await self.sandbox.execute(
                 cmd,
                 workspace_id=workspace_id,
+                workspace=workspace,
                 files=files,
             )
         except Exception as exc:

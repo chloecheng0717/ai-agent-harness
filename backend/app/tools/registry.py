@@ -7,7 +7,7 @@ Tools can be registered, discovered, and executed through the registry.
 
 import asyncio
 import time
-from typing import Any, Callable, Coroutine, Dict, List, Optional, Type
+from typing import TYPE_CHECKING, Any, Callable, Coroutine, Dict, List, Optional, Type
 
 import structlog
 
@@ -19,6 +19,10 @@ from app.models.tool import (
     ToolResult,
 )
 from app.tools.base import BaseTool
+
+if TYPE_CHECKING:
+    from app.sandbox.docker_sandbox import DockerSandbox
+    from app.sandbox.workspace import Workspace
 
 
 # Type alias for confirmation callbacks
@@ -50,7 +54,11 @@ class ToolRegistry:
         _max_history_size: Maximum number of execution records to keep
     """
     
-    def __init__(self, max_history_size: int = 100) -> None:
+    def __init__(
+        self,
+        max_history_size: int = 100,
+        sandbox: Optional["DockerSandbox"] = None,
+    ) -> None:
         """Initialize the tool registry."""
         self._tools: Dict[str, BaseTool] = {}
         self._tool_classes: Dict[str, Type[BaseTool]] = {}
@@ -58,7 +66,8 @@ class ToolRegistry:
         self._execution_history: List[Dict[str, Any]] = []
         self._max_history_size = max_history_size
         self._confirmation_callback: Optional[ConfirmationCallback] = None
-        
+        self.sandbox = sandbox
+
         self.logger = structlog.get_logger().bind(component="tool_registry")
         self.logger.info("Tool registry initialized")
     
@@ -281,14 +290,21 @@ class ToolRegistry:
                 success=False,
                 error="Invalid parameters",
             )
-        
+
+        # Resolve the persistent shared workspace for this execution run.
+        # The sandbox (when available) maps the workspace ID to the host
+        # path so every tool call within a run shares the same directory.
+        workspace: Optional["Workspace"] = None
+        if request.workspace_id and self.sandbox is not None:
+            workspace = self.sandbox.get_workspace(request.workspace_id)
+
         # Execute tool with timeout
         timeout = request.timeout or tool.definition.timeout
         start_time = time.time()
         
         try:
             result = await asyncio.wait_for(
-                tool.execute(request.parameters),
+                tool.execute(request.parameters, workspace=workspace),
                 timeout=timeout,
             )
             execution_time = (time.time() - start_time) * 1000

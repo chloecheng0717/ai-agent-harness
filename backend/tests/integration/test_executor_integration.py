@@ -54,7 +54,11 @@ class CountingTool(BaseTool):
         ))
         self.call_count = 0
 
-    async def execute(self, parameters: Dict[str, Any]) -> ToolResult:
+    async def execute(
+        self,
+        parameters: Dict[str, Any],
+        workspace: Any = None,
+    ) -> ToolResult:
         self.call_count += 1
         return ToolResult(
             success=True,
@@ -75,7 +79,11 @@ class ConditionalTool(BaseTool):
         ))
         self.call_count = 0
 
-    async def execute(self, parameters: Dict[str, Any]) -> ToolResult:
+    async def execute(
+        self,
+        parameters: Dict[str, Any],
+        workspace: Any = None,
+    ) -> ToolResult:
         self.call_count += 1
         if self.call_count == 1:
             return ToolResult(success=False, error="First call failure")
@@ -486,7 +494,11 @@ class StubTool(BaseTool):
         ))
         self._should_succeed = should_succeed
 
-    async def execute(self, parameters: Dict[str, Any]) -> ToolResult:
+    async def execute(
+        self,
+        parameters: Dict[str, Any],
+        workspace: Any = None,
+    ) -> ToolResult:
         if not self._should_succeed:
             return ToolResult(success=False, error="Stub tool failure")
         return ToolResult(success=True, output={"result": "ok"})

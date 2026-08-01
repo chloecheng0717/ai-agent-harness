@@ -6,7 +6,7 @@ This is a simple example to demonstrate the tool framework.
 """
 
 import math
-from typing import Any, Dict
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
 import structlog
 
@@ -19,6 +19,9 @@ from app.models.tool import (
     ToolResult,
 )
 from app.tools.base import BaseTool
+
+if TYPE_CHECKING:
+    from app.sandbox.workspace import Workspace
 
 
 class CalculatorTool(BaseTool):
@@ -67,13 +70,18 @@ class CalculatorTool(BaseTool):
         super().__init__(definition)
         self.logger = structlog.get_logger().bind(component="calculator_tool")
     
-    async def execute(self, parameters: Dict[str, Any]) -> ToolResult:
+    async def execute(
+        self,
+        parameters: Dict[str, Any],
+        workspace: Optional["Workspace"] = None,
+    ) -> ToolResult:
         """
         Execute the calculator tool.
-        
+
         Args:
             parameters: Must contain 'expression' key with the math expression
-            
+            workspace: Persistent shared workspace for the run (unused).
+
         Returns:
             ToolResult with the calculation result
         """

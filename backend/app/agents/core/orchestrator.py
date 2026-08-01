@@ -41,6 +41,7 @@ if TYPE_CHECKING:
     from app.agents.specialized.planner import PlannerAgent
     from app.tools.registry import ToolRegistry
     from app.memory.manager import MemoryManager
+    from app.sandbox.docker_sandbox import DockerSandbox
 
 
 # ── retry decorator ─────────────────────────────────────────────
@@ -92,6 +93,7 @@ class Orchestrator:
         planner: Optional["PlannerAgent"] = None,
         tool_registry: Optional["ToolRegistry"] = None,
         memory_manager: Optional["MemoryManager"] = None,
+        sandbox: Optional["DockerSandbox"] = None,
         max_iterations: Optional[int] = None,
     ) -> None:
         self.settings = get_settings()
@@ -102,6 +104,7 @@ class Orchestrator:
         self.planner = planner
         self.tool_registry = tool_registry
         self.memory_manager = memory_manager
+        self.sandbox = sandbox
 
         # Step registry — maps lifecycle steps to handler methods.
         # Subclasses or callers can override individual entries.
@@ -122,6 +125,7 @@ class Orchestrator:
             has_planner=planner is not None,
             has_tool_registry=tool_registry is not None,
             has_memory_manager=memory_manager is not None,
+            has_sandbox=sandbox is not None,
         )
 
     # ── LLM helpers ──────────────────────────────────────────
@@ -267,6 +271,14 @@ class Orchestrator:
 
         overall_start = time.monotonic()
 
+        # Create one persistent workspace for the entire run so that
+        # every tool call shares the same sandbox directory. The ID is
+        # stored on the state and consumed by execute_plan; it is removed
+        # when the lifecycle finishes.
+        workspace_id: Optional[str] = self._create_workspace()
+        if workspace_id is not None:
+            state.metadata["workspace_id"] = workspace_id
+
         try:
             # ── Phase 1: Initialisation (always runs once) ───────────
             for step in (LifecycleStep.INITIALIZE, LifecycleStep.UNDERSTAND_TASK):
@@ -339,6 +351,8 @@ class Orchestrator:
                 error=str(exc),
                 error_type=type(exc).__name__,
             )
+        finally:
+            self._cleanup_workspace(workspace_id)
 
         overall_ms = (time.monotonic() - overall_start) * 1000
         self.logger.info(
@@ -354,6 +368,46 @@ class Orchestrator:
         return state.to_result()
 
     # ── step runner with retry ───────────────────────────────
+
+    def _create_workspace(self) -> Optional[str]:
+        """
+        Create a persistent workspace for this run (when a sandbox is set).
+
+        Returns the workspace ID, or ``None`` when no sandbox is
+        configured (tools then fall back to per-call workspaces).
+        """
+        if self.sandbox is None:
+            return None
+        try:
+            workspace = self.sandbox.create_workspace()
+            self.logger.info(
+                "Created persistent workspace for run",
+                workspace_id=workspace.workspace_id,
+            )
+            return workspace.workspace_id
+        except Exception as exc:
+            self.logger.warning(
+                "Failed to create persistent workspace",
+                error=str(exc),
+            )
+            return None
+
+    def _cleanup_workspace(self, workspace_id: Optional[str]) -> None:
+        """Remove the persistent workspace for a finished run."""
+        if workspace_id is None or self.sandbox is None:
+            return
+        try:
+            self.sandbox.delete_workspace(workspace_id)
+            self.logger.info(
+                "Deleted persistent workspace for run",
+                workspace_id=workspace_id,
+            )
+        except Exception as exc:
+            self.logger.warning(
+                "Failed to delete persistent workspace",
+                workspace_id=workspace_id,
+                error=str(exc),
+            )
 
     async def _run_step(self, step: LifecycleStep, state: AgentState) -> AgentState:
         """
@@ -688,6 +742,7 @@ class Orchestrator:
                             ToolPermission.NETWORK,
                             ToolPermission.FILE_SYSTEM,
                         ],
+                        workspace_id=state.metadata.get("workspace_id"),
                     )
                     
                     try:

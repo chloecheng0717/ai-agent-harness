@@ -5,7 +5,7 @@ A placeholder tool that reads files from the filesystem.
 This is a simple example to demonstrate the tool framework.
 """
 
-from typing import Any, Dict
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
 import structlog
 
@@ -18,6 +18,9 @@ from app.models.tool import (
     ToolResult,
 )
 from app.tools.base import BaseTool
+
+if TYPE_CHECKING:
+    from app.sandbox.workspace import Workspace
 
 
 class FileReadTool(BaseTool):
@@ -86,13 +89,18 @@ class FileReadTool(BaseTool):
         super().__init__(definition)
         self.logger = structlog.get_logger().bind(component="file_read_tool")
     
-    async def execute(self, parameters: Dict[str, Any]) -> ToolResult:
+    async def execute(
+        self,
+        parameters: Dict[str, Any],
+        workspace: Optional["Workspace"] = None,
+    ) -> ToolResult:
         """
         Execute the file read tool.
-        
+
         Args:
             parameters: Must contain 'file_path' key
-            
+            workspace: Persistent shared workspace for the run (unused).
+
         Returns:
             ToolResult with the file content
         """

@@ -204,6 +204,10 @@ class ToolExecutionRequest(BaseModel):
         default_factory=list,
         description="Permissions granted to the requesting agent"
     )
+    workspace_id: Optional[str] = Field(
+        default=None,
+        description="ID of the persistent shared workspace for this execution run"
+    )
     confirmation_token: Optional[str] = Field(
         default=None,
         description="Token from user confirmation if required"
