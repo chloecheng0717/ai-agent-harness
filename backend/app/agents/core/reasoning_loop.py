@@ -166,48 +166,71 @@ class ReasoningLoop:
         initial_state: Dict[str, Any],
         reasoning_fn: Any,
         action_fn: Any,
+        tool_registry: Any = None,
     ) -> Dict[str, Any]:
         """
         Run the reasoning loop.
-        
+
         This method executes the ReAct loop until completion or max iterations.
-        
+
         Args:
-            initial_state: Initial state for reasoning
-            reasoning_fn: Async function for reasoning (thought generation)
-            action_fn: Async function for action execution
-            
+            initial_state: Initial state for reasoning.  When the state
+                contains a ``"plan"`` list the loop becomes plan-driven: it
+                walks the plan in dependency order, records each
+                observation, and does not repeat failed steps.
+            reasoning_fn: Async function for reasoning (thought generation).
+                Skipped when the loop is plan-driven or an action is queued,
+                which reduces unnecessary LLM calls.
+            action_fn: Async function for action execution.
+            tool_registry: Optional ToolRegistry.  When set and the chosen
+                action matches a registered tool, the tool is executed
+                through the registry so the loop only trusts real tool
+                outputs.
+
         Returns:
             Dict containing final state and reasoning history
         """
         self.logger.debug("Starting reasoning loop")
-        
+
         state = initial_state.copy()
         history: List[ReasoningStep] = []
         found_flag: Optional[str] = None
-        
+        plan_driven = isinstance(state.get("plan"), list) and bool(state["plan"])
+
         for iteration in range(self.max_iterations):
             self.logger.debug(
                 "Reasoning iteration",
                 iteration=iteration + 1,
                 max_iterations=self.max_iterations,
             )
-            
-            # Reason: Generate thought
-            thought = await reasoning_fn(state)
-            
+
+            # Reason: Generate thought.  Skipped in plan-driven mode and
+            # when an action is already queued — this avoids needless LLM
+            # calls while preserving the Plan → Execute → Observe loop.
+            if plan_driven:
+                thought = "Executing next plan step."
+            elif state.get("next_action") is not None:
+                thought = "Proceeding with the queued action."
+            else:
+                thought = await reasoning_fn(state)
+
             # Act: Decide and execute action
             action, action_input = await self._decide_action(thought, state)
-            
-            # Observe: Get action result
-            observation = await action_fn(action, action_input)
-            
+
+            # Observe: Get action result.  Tool actions go through the real
+            # registry when one is provided so observations reflect actual
+            # tool output rather than model guesses.
+            if tool_registry is not None and action in self._registry_tools(tool_registry):
+                observation = await self._execute_tool(tool_registry, action, action_input)
+            else:
+                observation = await action_fn(action, action_input)
+
             # Check observation for flags
             if isinstance(observation, dict):
                 found_flag = self.flag_detector.scan_dict(observation)
             elif isinstance(observation, str):
                 found_flag = self.flag_detector.scan(observation)
-            
+
             # Record step
             step = ReasoningStep(
                 thought=thought,
@@ -216,10 +239,10 @@ class ReasoningLoop:
                 observation=observation,
             )
             history.append(step)
-            
+
             # Update state
             state = await self._update_state(state, step)
-            
+
             # Terminate if flag found
             if found_flag:
                 self.logger.info(
@@ -228,12 +251,12 @@ class ReasoningLoop:
                 )
                 state["found_flag"] = found_flag
                 break
-            
+
             # Check if task is complete
             if await self._is_complete(state):
                 self.logger.debug("Task completed in reasoning loop")
                 break
-        
+
         return {
             "state": state,
             "history": [
@@ -248,26 +271,53 @@ class ReasoningLoop:
             "iterations": len(history),
             "found_flag": found_flag,
         }
-    
+
     async def _decide_action(
         self,
         thought: str,
         state: Dict[str, Any],
     ) -> tuple[str, Dict[str, Any]]:
         """
-        Decide on an action based on the current thought.
-        
+        Decide on an action based on the current thought and state.
+
+        Priority:
+        1. A queued ``next_action`` in state (consumed here).
+        2. The next runnable plan step, in dependency order.  Steps that
+           already executed (successfully or not) are never repeated.
+        3. Fall back to a thinking step for free-form reasoning.
+
         Args:
             thought: Current reasoning thought
             state: Current state
-            
+
         Returns:
             Tuple of (action_name, action_input)
         """
-        # TODO: Implement action decision using LLM
-        # This is a placeholder
+        # 1. Consume a pre-queued action.
+        queued = state.get("next_action")
+        if isinstance(queued, dict) and queued:
+            state["next_action"] = None
+            state["_current_step_index"] = queued.get("step_index")
+            return queued.get("action", "think"), queued.get("action_input") or {}
+
+        # 2. Plan-driven mode.
+        plan = state.get("plan")
+        if isinstance(plan, list) and plan:
+            for step in plan:
+                if step.get("executed"):
+                    continue
+                deps = step.get("depends_on") or []
+                if not all(self._step_succeeded(plan, dep) for dep in deps):
+                    continue
+                state["_current_step_index"] = step.get("index")
+                tool = step.get("tool_name")
+                action = tool if tool else "think"
+                return action, step.get("tool_parameters") or {}
+
+        # 3. Free-form reasoning fallback.
+        state["_current_step_index"] = None
         return "think", {"thought": thought}
-    
+
     async def _update_state(
         self,
         state: Dict[str, Any],
@@ -275,26 +325,117 @@ class ReasoningLoop:
     ) -> Dict[str, Any]:
         """
         Update state based on reasoning step.
-        
-        Args:
-            state: Current state
-            step: Reasoning step
-            
-        Returns:
-            Updated state
+
+        Records every action/observation, marks failed actions so they are
+        never repeated, and advances plan-driven execution by flagging the
+        current step as executed.
         """
-        # TODO: Implement state update logic
+        actions = state.setdefault("actions_taken", [])
+        actions.append(
+            {
+                "action": step.action,
+                "action_input": step.action_input,
+                "observation": step.observation,
+            }
+        )
+
+        observations = state.setdefault("observations", [])
+        observations.append(step.observation)
+
+        success = self._observation_success(step.observation)
+        if not success:
+            state.setdefault("failed_actions", []).append(
+                {
+                    "action": step.action,
+                    "action_input": step.action_input,
+                }
+            )
+
+        plan = state.get("plan")
+        current_index = state.get("_current_step_index")
+        if isinstance(plan, list) and current_index is not None:
+            for plan_step in plan:
+                if plan_step.get("index") == current_index:
+                    plan_step["executed"] = True
+                    plan_step["success"] = success
+                    plan_step["observation"] = step.observation
+
         return state
-    
+
     async def _is_complete(self, state: Dict[str, Any]) -> bool:
         """
         Check if the task is complete.
-        
-        Args:
-            state: Current state
-            
-        Returns:
-            True if complete, False otherwise
+
+        Returns True when:
+        * A flag was found.
+        * ``task_complete`` is set in state.
+        * Every step of a plan-driven run has executed.
         """
-        # TODO: Implement completion check
+        if state.get("found_flag"):
+            return True
+        if state.get("task_complete"):
+            return True
+
+        plan = state.get("plan")
+        if isinstance(plan, list) and plan:
+            return all(step.get("executed") for step in plan)
+
         return False
+
+    # ── tool-aware execution helpers ──────────────────────────
+
+    @staticmethod
+    def _registry_tools(tool_registry: Any) -> list[str]:
+        """Return the registered tool names for a ToolRegistry."""
+        try:
+            return [t["name"] for t in tool_registry.list_tools()]
+        except Exception:
+            return []
+
+    @staticmethod
+    async def _execute_tool(
+        tool_registry: Any,
+        action: str,
+        action_input: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Execute a tool through the registry and return a real result."""
+        tool = tool_registry.get_tool(action)
+        if tool is None:
+            return {"success": False, "error": f"Tool '{action}' not found"}
+
+        from app.models.tool import ToolExecutionRequest, ToolPermission
+
+        request = ToolExecutionRequest(
+            tool_name=action,
+            parameters=action_input or {},
+            agent_permissions=[
+                ToolPermission.READ,
+                ToolPermission.WRITE,
+                ToolPermission.EXECUTE,
+            ],
+        )
+        result = await tool_registry.execute(request)
+        return {
+            "tool_name": action,
+            "success": result.success,
+            "output": result.output,
+            "error": result.error,
+        }
+
+    @staticmethod
+    def _step_succeeded(plan: list[dict[str, Any]], index: int) -> bool:
+        """Whether the plan step at *index* executed successfully."""
+        for step in plan:
+            if step.get("index") == index:
+                return bool(step.get("success"))
+        return False
+
+    @staticmethod
+    def _observation_success(observation: Any) -> bool:
+        """Determine whether an observation indicates success."""
+        if isinstance(observation, dict):
+            if "success" in observation:
+                return bool(observation.get("success"))
+            if observation.get("error"):
+                return False
+        return True

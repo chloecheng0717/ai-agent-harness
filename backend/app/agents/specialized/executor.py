@@ -16,6 +16,7 @@ Responsibilities
 """
 
 import asyncio
+import json
 import time
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
@@ -134,7 +135,7 @@ class ExecutorAgent(BaseAgent):
                 "execution_history": [],
             }
 
-        registry: Optional["ToolRegistry"] = (
+        registry: ToolRegistry | None = (
             input_data.get("tool_registry") or self.tool_registry
         )
 
@@ -337,6 +338,9 @@ class ExecutorAgent(BaseAgent):
         records: List[ExecutionRecord] = []
 
         failed_indices: set = set()
+        # Successful tool invocations are reused for identical later steps so
+        # the same tool is never called twice with the same parameters.
+        reuse_cache: dict[tuple[str, str], ExecutionResult] = {}
 
         try:
             ordered_steps = self._resolve_execution_order(plan)
@@ -361,6 +365,39 @@ class ExecutorAgent(BaseAgent):
                 )
                 continue
 
+            # Reuse the output of a previous identical successful call.
+            cache_key: tuple[str, str] | None = None
+            if step.tool_name:
+                cache_key = (
+                    step.tool_name,
+                    json.dumps(step.tool_parameters or {}, sort_keys=True),
+                )
+            if cache_key is not None and cache_key in reuse_cache:
+                prior = reuse_cache[cache_key]
+                step_result = ExecutionResult(
+                    step_index=step.index,
+                    tool_name=step.tool_name,
+                    success=True,
+                    output=prior.output,
+                    metadata={"reused_from": prior.step_index},
+                )
+                results.append(step_result)
+                if step_result.tool_name and step_result.tool_name not in tools_used:
+                    tools_used.append(step_result.tool_name)
+                record = ExecutionRecord(
+                    step_index=step.index,
+                    description=step.description,
+                    tool_name=step.tool_name,
+                )
+                record.mark_completed(step_result)
+                records.append(record)
+                self.logger.info(
+                    "Step reused previous tool output",
+                    step_index=step.index,
+                    reused_from=prior.step_index,
+                )
+                continue
+
             record = ExecutionRecord(
                 step_index=step.index,
                 description=step.description,
@@ -380,6 +417,8 @@ class ExecutorAgent(BaseAgent):
 
             if step_result.success:
                 record.mark_completed(step_result)
+                if cache_key is not None:
+                    reuse_cache[cache_key] = step_result
                 self.logger.info(
                     "Step executed successfully",
                     step_index=step.index,

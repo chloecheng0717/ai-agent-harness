@@ -14,11 +14,13 @@ Responsibilities
 """
 
 import json
+import re
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import structlog
 
 from app.agents.base import AgentConfig, BaseAgent
+from app.agents.core.tool_selector import ToolSelector
 from app.models.agent import AgentType
 from app.models.llm import (
     BaseLLMProvider,
@@ -26,10 +28,11 @@ from app.models.llm import (
     ChatMessage,
     LLMProviderError,
 )
-from app.models.state import AgentState, PlanStep
+from app.models.state import PlanStep
 
 if TYPE_CHECKING:
     from app.memory.manager import MemoryManager
+    from app.tools.registry import ToolRegistry
 
 
 # ── Constants ────────────────────────────────────────────────────
@@ -38,6 +41,18 @@ VALID_PRIORITIES = {"low", "medium", "high", "critical"}
 
 MAX_PLAN_STEPS = 20
 MAX_REVISION_ATTEMPTS = 3
+
+# Tokens embedded in a goal that hint at encoded data.  Lookaround
+# assertions (rather than \b) delimit base64 tokens so the optional
+# "=" padding stays part of the match.
+_B64_PADDED_RE = re.compile(
+    r"(?<![A-Za-z0-9+/])[A-Za-z0-9+/]{4,}={1,2}(?![A-Za-z0-9+/=])"
+)
+_B64_TOKEN_RE = re.compile(
+    r"(?<![A-Za-z0-9+/])[A-Za-z0-9+/]{8,}(?![A-Za-z0-9+/=])"
+)
+_HEX_TOKEN_RE = re.compile(r"\b[0-9a-fA-F]{8,}\b")
+_URL_TOKEN_RE = re.compile(r"%[0-9a-fA-F]{2}")
 
 _PLANNING_SYSTEM_PROMPT = """\
 You are an expert planning agent.  Given a goal, decompose it into a
@@ -104,6 +119,7 @@ class PlannerAgent(BaseAgent):
         llm_provider: Optional[BaseLLMProvider] = None,
         max_plan_steps: int = MAX_PLAN_STEPS,
         memory_manager: Optional["MemoryManager"] = None,
+        tool_registry: Optional["ToolRegistry"] = None,
     ) -> None:
         if config is None:
             config = AgentConfig(
@@ -115,6 +131,8 @@ class PlannerAgent(BaseAgent):
         self.llm_provider = llm_provider
         self.max_plan_steps = max_plan_steps
         self.memory_manager = memory_manager
+        self.tool_registry = tool_registry
+        self.tool_selector = ToolSelector()
         self.logger = self.logger.bind(component="planner_agent")
 
     # ── BaseAgent interface ───────────────────────────────────
@@ -150,10 +168,17 @@ class PlannerAgent(BaseAgent):
         if not goal:
             return {"success": False, "plan": [], "errors": ["No goal provided."]}
 
+        # Resolve the available tool set from an explicit list or a registry.
+        tool_registry: ToolRegistry | None = (
+            input_data.get("tool_registry") or self.tool_registry
+        )
+        if not tools_available and tool_registry is not None:
+            tools_available = [t["name"] for t in tool_registry.list_tools()]
+
         # Decide whether to generate or revise
         if previous_plan and errors:
             self.logger.info("Revising existing plan", goal=goal, error_count=len(errors))
-            steps = await self.revise_plan(previous_plan, errors, feedback)
+            steps = await self.revise_plan(previous_plan, errors, feedback, tools_available)
         else:
             # Enrich context with previous plans from memory
             enriched_context = context
@@ -161,6 +186,10 @@ class PlannerAgent(BaseAgent):
                 enriched_context = await self._enrich_with_memory(goal, context)
             self.logger.info("Generating new plan", goal=goal)
             steps = await self._plan_from_llm(goal, tools_available, enriched_context, tool_descriptions)
+
+        # Post-process: deterministic tool selection, deduplication, and
+        # dependency fixing make the plan concrete and reproducible.
+        steps = self._refine_plan(steps, tools_available)
 
         # Validate
         validation_errors = self.validate_plan(steps)
@@ -267,7 +296,7 @@ class PlannerAgent(BaseAgent):
         """
         if self.llm_provider is None:
             self.logger.info("No LLM provider, using template plan")
-            return self._plan_from_template(goal)
+            return self._template_fallback(goal, tools_available)
 
         if tool_descriptions:
             tools_section = tool_descriptions
@@ -295,13 +324,14 @@ class PlannerAgent(BaseAgent):
         except Exception as exc:
             self.logger.error("Unexpected planning error", error=str(exc))
 
-        return self._plan_from_template(goal)
+        return self._template_fallback(goal, tools_available)
 
     async def revise_plan(
         self,
         previous_plan: List[Dict[str, Any]],
         errors: List[str],
         feedback: str = "",
+        tools_available: list[str] | None = None,
     ) -> List[PlanStep]:
         """
         Ask the LLM to revise a previously failed plan.
@@ -314,16 +344,19 @@ class PlannerAgent(BaseAgent):
             Errors encountered during execution.
         feedback : str, optional
             Additional human feedback.
+        tools_available : list[str], optional
+            Tools that may be used in the revised plan.  When no LLM is
+            configured this drives deterministic failure recovery.
 
         Returns
         -------
         list[PlanStep]
             Revised plan steps.
         """
+        available = tools_available or []
         if self.llm_provider is None:
-            self.logger.info("No LLM provider for revision, using template fallback")
-            goal = self.get_memory("last_goal") or "unknown task"
-            return self._plan_from_template(goal)
+            self.logger.info("No LLM provider for revision, using recovery fallback")
+            return self._recover_from_failures(previous_plan, errors, available)
 
         goal = self.get_memory("last_goal") or "unknown task"
         user_content = (
@@ -351,7 +384,7 @@ class PlannerAgent(BaseAgent):
                         attempt=attempt,
                         step_count=len(steps),
                     )
-                    return steps
+                    return self._refine_plan(steps, available)
             except Exception as exc:
                 self.logger.warning(
                     "Revision attempt failed",
@@ -360,7 +393,7 @@ class PlannerAgent(BaseAgent):
                 )
 
         self.logger.error("All revision attempts failed, using template fallback")
-        return self._plan_from_template(goal)
+        return self._template_fallback(goal, available)
 
     # ── Template fallback ─────────────────────────────────────
 
@@ -388,6 +421,164 @@ class PlannerAgent(BaseAgent):
                 expected_output="Result of the requested task.",
             )
         ]
+
+    def _template_fallback(
+        self,
+        goal: str,
+        tools_available: list[str],
+    ) -> list[PlanStep]:
+        """
+        Build a fallback plan, preferring a tool-aware template whenever
+        available tools exist and the goal matches a known tool pattern.
+        """
+        if tools_available:
+            steps = self._plan_from_template_for_tools(goal, tools_available)
+            if steps:
+                return steps
+        return self._plan_from_template(goal)
+
+    @classmethod
+    def _plan_from_template_for_tools(
+        cls,
+        goal: str,
+        tools_available: list[str],
+    ) -> list[PlanStep]:
+        """
+        Build a template plan that makes use of the available tools.
+
+        Returns an empty list when the goal does not clearly map onto any
+        available tool so the caller can fall back to the generic template.
+        """
+        tools = set(tools_available)
+        lower = goal.lower()
+
+        # Strong per-tool signals.  "extract printable strings from binary"
+        # must resolve to the strings tool, not the archive tool.
+        strings_hint = any(
+            kw in lower for kw in ("strings", "binary", "printable", "ascii")
+        )
+        archive_hint = any(
+            kw in lower for kw in (
+                "archive", "zip", "tar", "gzip", "7z", "unzip", "decompress"
+            )
+        )
+        extract_hint = "extract" in lower
+
+        if strings_hint and "strings" in tools:
+            return [
+                PlanStep(
+                    index=0,
+                    description=f"Extract printable strings: {goal}",
+                    tool_name="strings",
+                    tool_parameters={},
+                    depends_on=[],
+                    rationale="String extraction reveals human-readable content in binary data.",
+                    priority="high",
+                    estimated_tools=["strings"],
+                    expected_output="List of printable strings",
+                )
+            ]
+
+        if "archive" in tools and (archive_hint or extract_hint):
+            steps: list[PlanStep] = [
+                PlanStep(
+                    index=0,
+                    description=f"Extract archive: {goal}",
+                    tool_name="archive",
+                    tool_parameters={},
+                    depends_on=[],
+                    rationale="Archive contents must be unpacked before they can be analysed.",
+                    priority="high",
+                    estimated_tools=["archive"],
+                    expected_output="Extracted file names and destination path",
+                )
+            ]
+            next_index = 1
+            if "strings" in tools:
+                steps.append(
+                    PlanStep(
+                        index=next_index,
+                        description="Extract printable strings from the extracted files",
+                        tool_name="strings",
+                        tool_parameters={},
+                        depends_on=[next_index - 1],
+                        rationale="String extraction surfaces hidden text inside binary files.",
+                        priority="high",
+                        estimated_tools=["strings"],
+                        expected_output="List of printable strings found in extracted files",
+                    )
+                )
+                next_index += 1
+            if "file" in tools:
+                steps.append(
+                    PlanStep(
+                        index=next_index,
+                        description="Identify the file types of extracted files",
+                        tool_name="file",
+                        tool_parameters={},
+                        depends_on=[next_index - 1],
+                        rationale="File type identification guides further analysis of the payload.",
+                        priority="medium",
+                        estimated_tools=["file"],
+                        expected_output="MIME type and description for each extracted file",
+                    )
+                )
+            return steps
+
+        encoding = cls._detect_encoding(goal)
+        encoding_keywords = (
+            "encode", "decode", "base64", "hex", "url", "cipher", "encoded", "decoded"
+        )
+        if "encoding" in tools and (
+            encoding is not None or any(kw in lower for kw in encoding_keywords)
+        ):
+            params: dict[str, Any] = {"mode": "auto"}
+            if encoding is not None:
+                params["encoding"] = encoding[0]
+                params["input"] = encoding[1]
+            return [
+                PlanStep(
+                    index=0,
+                    description=f"Encode or decode data for: {goal}",
+                    tool_name="encoding",
+                    tool_parameters=params,
+                    depends_on=[],
+                    rationale="Encoded data must be transformed before its meaning can be assessed.",
+                    priority="high",
+                    estimated_tools=["encoding"],
+                    expected_output="Decoded or encoded output from the encoding tool",
+                )
+            ]
+
+        return []
+
+    @staticmethod
+    def _detect_encoding(goal: str) -> tuple[str, str] | None:
+        """
+        Return ``(encoding, token)`` for an encoding hint embedded in a
+        goal, or ``None`` when no encoded token is present.
+
+        Padded base64 is checked first (its ``=`` suffix makes it the
+        least ambiguous), then hex, then long unpadded base64, then URL
+        percent-encoding.
+        """
+        padded_match = _B64_PADDED_RE.search(goal)
+        if padded_match:
+            return ("base64", padded_match.group(0))
+
+        hex_match = _HEX_TOKEN_RE.search(goal)
+        if hex_match and len(hex_match.group(0)) % 2 == 0:
+            return ("hex", hex_match.group(0))
+
+        b64_match = _B64_TOKEN_RE.search(goal)
+        if b64_match:
+            return ("base64", b64_match.group(0))
+
+        url_match = _URL_TOKEN_RE.search(goal)
+        if url_match:
+            return ("url", url_match.group(0))
+
+        return None
 
     # ── JSON parsing ──────────────────────────────────────────
 
@@ -448,6 +639,238 @@ class PlannerAgent(BaseAgent):
                 lines = lines[:-1]
             cleaned = "\n".join(lines)
         return cleaned.strip()
+
+    # ── Plan refinement (tool selection) ──────────────────────
+
+    def _refine_plan(
+        self,
+        steps: list[PlanStep],
+        tools_available: list[str],
+    ) -> list[PlanStep]:
+        """
+        Post-process a generated or revised plan.
+
+        * Assigns the best available tool to every step that needs one.
+        * Replaces references to unavailable tools.
+        * Collapses duplicate tool invocations into reuses.
+        """
+        if not steps or not tools_available:
+            return steps
+        self._assign_tools(steps, tools_available)
+        self._dedupe_steps(steps)
+        return steps
+
+    def _assign_tools(
+        self,
+        steps: list[PlanStep],
+        tools_available: list[str],
+    ) -> None:
+        """
+        Deterministically assign tools to plan steps.
+
+        An explicit available tool name is kept; otherwise the
+        :class:`ToolSelector` picks the best match from the step's
+        description, rationale, and expected output.  Steps referencing a
+        tool that is not available are downgraded to reasoning steps.
+        """
+        available = list(tools_available)
+        for step in steps:
+            current = step.tool_name
+            if current and current in available:
+                continue
+            best = self.tool_selector.select_for_step(step, available)
+            if best is not None:
+                step.tool_name = best
+                if not step.estimated_tools:
+                    step.estimated_tools = [best]
+            elif current and current not in available:
+                self.logger.warning(
+                    "Step references unavailable tool",
+                    tool_name=current,
+                    step_index=step.index,
+                )
+                step.tool_name = None
+                step.tool_parameters = {}
+
+    def _dedupe_steps(self, steps: list[PlanStep]) -> None:
+        """
+        Avoid invoking the same tool with the same parameters twice.
+
+        When a later step would repeat an identical ``(tool, parameters)``
+        pair, it is converted into a reasoning step that depends on the
+        earlier step's output instead of issuing a second tool call.
+        """
+        seen: dict[tuple[str, str], int] = {}
+        for step in steps:
+            if not step.tool_name:
+                continue
+            key = (
+                step.tool_name,
+                json.dumps(step.tool_parameters or {}, sort_keys=True),
+            )
+            if key in seen:
+                first_index = seen[key]
+                self.logger.info(
+                    "Deduplicating repeated tool invocation",
+                    tool_name=step.tool_name,
+                    step_index=step.index,
+                    reuses_index=first_index,
+                )
+                step.tool_name = None
+                step.tool_parameters = {}
+                if first_index not in step.depends_on:
+                    step.depends_on.append(first_index)
+                step.rationale = (
+                    f"Reuses the output of step {first_index} to avoid a "
+                    "duplicate tool call."
+                )
+            else:
+                seen[key] = step.index
+
+    # ── Deterministic failure recovery ────────────────────────
+
+    def _recover_from_failures(
+        self,
+        previous_plan: list[dict[str, Any]],
+        errors: list[str],
+        tools_available: list[str],
+    ) -> list[PlanStep]:
+        """
+        Repair a failed plan without an LLM.
+
+        Failed steps are dropped (along with their dependents) and replaced
+        by an alternative approach.  The same tool/parameters that failed
+        are never repeated; a different dedicated tool — or ``python`` as a
+        general fallback — is used instead.
+        """
+        if not tools_available:
+            goal = self.get_memory("last_goal") or "unknown task"
+            return self._plan_from_template(goal)
+
+        tools = set(tools_available)
+        error_text = " ".join(errors).lower()
+
+        # Identify failed step indices from executor-style error messages
+        # like "Step 0: <message>" or "Tool 'archive' failed: <message>".
+        failed_indices: set[int] = set()
+        for err in errors:
+            match = re.search(r"\bstep\s+(\d+)", err, re.IGNORECASE)
+            if match:
+                failed_indices.add(int(match.group(1)))
+        failed_tools: list[str] = []
+        for step in previous_plan:
+            name = step.get("tool_name")
+            if not name:
+                continue
+            index = step.get("index", 0)
+            if index in failed_indices or name.lower() in error_text:
+                failed_tools.append(name)
+
+        # Keep only steps that did not fail and do not depend on a failure.
+        surviving: list[PlanStep] = []
+        for step in previous_plan:
+            index = step.get("index", 0)
+            if index in failed_indices:
+                continue
+            if any(dep in failed_indices for dep in step.get("depends_on", [])):
+                continue
+            surviving.append(self._to_plan_step(step))
+
+        # Build one recovery step per failed tool, using an alternative.
+        recovery: list[PlanStep] = []
+        for failed_tool in failed_tools:
+            alternative = self._alternative_tool(failed_tool, tools)
+            if alternative is None:
+                self.logger.warning(
+                    "No alternative tool for failed tool",
+                    tool_name=failed_tool,
+                )
+                continue
+            recovery.append(
+                PlanStep(
+                    index=0,
+                    description=(
+                        f"Recover from failed '{failed_tool}' by using "
+                        f"'{alternative}' instead"
+                    ),
+                    tool_name=alternative,
+                    tool_parameters={},
+                    depends_on=[],
+                    rationale=(
+                        f"'{failed_tool}' failed, so try '{alternative}' "
+                        "instead of repeating the failed action."
+                    ),
+                    priority="high",
+                    estimated_tools=[alternative],
+                    expected_output="Successful result via the alternative tool",
+                )
+            )
+
+        combined = surviving + recovery
+        if not combined:
+            goal = self.get_memory("last_goal") or "unknown task"
+            return (
+                self._plan_from_template_for_tools(goal, tools_available)
+                or self._plan_from_template(goal)
+            )
+        return self._reindex(combined)
+
+    @staticmethod
+    def _alternative_tool(failed_tool: str, tools: set[str]) -> str | None:
+        """Choose a different tool to try after *failed_tool* failed."""
+        alternatives: dict[str, list[str]] = {
+            "archive": ["python", "strings", "file"],
+            "encoding": ["python", "file"],
+            "strings": ["file", "python"],
+            "file": ["python"],
+            "python": ["file", "strings", "encoding", "archive"],
+            "calculator": ["python"],
+            "web_search": ["file"],
+        }
+        for candidate in alternatives.get(failed_tool, []):
+            if candidate in tools:
+                return candidate
+        return None
+
+    @staticmethod
+    def _reindex(steps: list[PlanStep]) -> list[PlanStep]:
+        """
+        Renumber plan step indices contiguously and remap dependencies.
+        """
+        old_to_new = {step.index: i for i, step in enumerate(steps)}
+        reindexed: list[PlanStep] = []
+        for i, step in enumerate(steps):
+            reindexed.append(
+                PlanStep(
+                    index=i,
+                    description=step.description,
+                    tool_name=step.tool_name,
+                    tool_parameters=step.tool_parameters,
+                    depends_on=[
+                        old_to_new[d] for d in step.depends_on if d in old_to_new
+                    ],
+                    rationale=step.rationale,
+                    priority=step.priority,
+                    estimated_tools=step.estimated_tools,
+                    expected_output=step.expected_output,
+                )
+            )
+        return reindexed
+
+    @staticmethod
+    def _to_plan_step(step: dict[str, Any]) -> PlanStep:
+        """Convert a serialised step dict into a :class:`PlanStep`."""
+        return PlanStep(
+            index=step.get("index", 0),
+            description=str(step.get("description", "Step")),
+            tool_name=step.get("tool_name"),
+            tool_parameters=step.get("tool_parameters") or {},
+            depends_on=step.get("depends_on") or [],
+            rationale=step.get("rationale", ""),
+            priority=step.get("priority", "medium"),
+            estimated_tools=step.get("estimated_tools") or [],
+            expected_output=step.get("expected_output"),
+        )
 
     # ── Plan validation ───────────────────────────────────────
 

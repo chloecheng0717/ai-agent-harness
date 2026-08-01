@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Any, Callable, Coroutine, Dict, List, Optional
 
 import structlog
 
+from app.agents.core.tool_selector import ToolSelector
 from app.config import get_settings
 from app.models.llm import (
     BaseLLMProvider,
@@ -118,6 +119,10 @@ class Orchestrator:
             LifecycleStep.REFLECT: self.reflect,
             LifecycleStep.RESPOND: self.respond,
         }
+
+        # Caches successful tool outputs within one plan-execute cycle so
+        # identical tool calls are never repeated.  Cleared each iteration.
+        self._execution_cache: dict[str, dict[str, Any]] = {}
 
         self.logger.info(
             "Orchestrator initialised",
@@ -312,6 +317,7 @@ class Orchestrator:
                     state.results.clear()
                     state.errors.clear()
                     state.tools_used.clear()
+                    self._execution_cache.clear()
 
                 for step in _inner_steps:
                     state = await self._run_step(step, state)
@@ -589,6 +595,7 @@ class Orchestrator:
                     "tools_available": state.tools_available,
                     "tool_descriptions": tools_desc,
                     "context": self._plan_context(state),
+                    "tool_registry": self.tool_registry,
                 })
                 if result["success"] and result["plan"]:
                     state.plan = [
@@ -664,12 +671,11 @@ class Orchestrator:
         """
         Map each plan step to the tools needed to execute it.
 
-        This step is the hook point for LLM-based tool selection.
-        The default implementation does nothing — tool selection will
-        be delegated to a dedicated selector component later.
-
-        When a ToolRegistry is available, this step can validate that
-        the tools in the plan are actually registered.
+        Uses a deterministic :class:`ToolSelector` to assign a concrete tool
+        to every step that needs one.  Dedicated tools are preferred over
+        generic fallbacks, and steps referencing unavailable tools are
+        downgraded to reasoning steps.  The chosen tools are recorded in
+        ``state.metadata["selected_tools"]``.
 
         Parameters
         ----------
@@ -681,20 +687,35 @@ class Orchestrator:
         AgentState
             State ready for execution.
         """
-        # Validate tools in plan against registry if available
-        if self.tool_registry is not None:
-            available_tools = {
-                t["name"] for t in self.tool_registry.list_tools()
-            }
-            
-            for plan_step in state.plan:
-                if plan_step.tool_name and plan_step.tool_name not in available_tools:
-                    self.logger.warning(
-                        "Tool not in registry",
-                        tool_name=plan_step.tool_name,
-                        step_index=plan_step.index,
-                    )
-        
+        if self.tool_registry is None:
+            return state
+
+        available_tools = [t["name"] for t in self.tool_registry.list_tools()]
+        selector = ToolSelector()
+        selected: list[str] = []
+
+        for plan_step in state.plan:
+            best = selector.select_for_step(plan_step, available_tools)
+            if best is not None and plan_step.tool_name != best:
+                self.logger.info(
+                    "Selected tool for step",
+                    step_index=plan_step.index,
+                    previous_tool=plan_step.tool_name,
+                    selected_tool=best,
+                )
+                plan_step.tool_name = best
+            elif plan_step.tool_name and plan_step.tool_name not in available_tools:
+                self.logger.warning(
+                    "Tool not in registry",
+                    tool_name=plan_step.tool_name,
+                    step_index=plan_step.index,
+                )
+                plan_step.tool_name = None
+
+            if plan_step.tool_name:
+                selected.append(plan_step.tool_name)
+
+        state.metadata["selected_tools"] = selected
         return state
 
     async def execute_plan(self, state: AgentState) -> AgentState:
@@ -731,35 +752,57 @@ class Orchestrator:
                 
                 # Use ToolRegistry if available
                 if self.tool_registry is not None:
-                    # Create execution request with default permissions
-                    request = ToolExecutionRequest(
-                        tool_name=plan_step.tool_name,
-                        parameters=plan_step.tool_parameters,
-                        agent_permissions=[
-                            ToolPermission.READ,
-                            ToolPermission.WRITE,
-                            ToolPermission.EXECUTE,
-                            ToolPermission.NETWORK,
-                            ToolPermission.FILE_SYSTEM,
-                        ],
-                        workspace_id=state.metadata.get("workspace_id"),
+                    # Reuse the output of an identical earlier successful call
+                    # so the same tool is not invoked twice.
+                    cache_key = (
+                        f"{plan_step.tool_name}:"
+                        + json.dumps(plan_step.tool_parameters or {}, sort_keys=True)
                     )
-                    
-                    try:
-                        tool_result = await self.tool_registry.execute(request)
-                        result["success"] = tool_result.success
-                        result["output"] = tool_result.output
-                        if not tool_result.success:
-                            result["error"] = tool_result.error
-                            state.add_error(
-                                f"Tool '{plan_step.tool_name}' failed: {tool_result.error}"
-                            )
-                    except Exception as exc:
-                        result["success"] = False
-                        result["error"] = str(exc)
-                        state.add_error(
-                            f"Tool '{plan_step.tool_name}' execution error: {exc}"
+                    if cache_key in self._execution_cache:
+                        prior = self._execution_cache[cache_key]
+                        result["success"] = True
+                        result["output"] = prior.get("output")
+                        result["reused_output_of"] = prior.get("step_index")
+                        self.logger.info(
+                            "Reusing previous tool output",
+                            step_index=plan_step.index,
+                            reused_from=prior.get("step_index"),
                         )
+                    else:
+                        # Create execution request with default permissions
+                        request = ToolExecutionRequest(
+                            tool_name=plan_step.tool_name,
+                            parameters=plan_step.tool_parameters,
+                            agent_permissions=[
+                                ToolPermission.READ,
+                                ToolPermission.WRITE,
+                                ToolPermission.EXECUTE,
+                                ToolPermission.NETWORK,
+                                ToolPermission.FILE_SYSTEM,
+                            ],
+                            workspace_id=state.metadata.get("workspace_id"),
+                        )
+
+                        try:
+                            tool_result = await self.tool_registry.execute(request)
+                            result["success"] = tool_result.success
+                            result["output"] = tool_result.output
+                            if not tool_result.success:
+                                result["error"] = tool_result.error
+                                state.add_error(
+                                    f"Tool '{plan_step.tool_name}' failed: {tool_result.error}"
+                                )
+                            else:
+                                self._execution_cache[cache_key] = {
+                                    "step_index": plan_step.index,
+                                    "output": tool_result.output,
+                                }
+                        except Exception as exc:
+                            result["success"] = False
+                            result["error"] = str(exc)
+                            state.add_error(
+                                f"Tool '{plan_step.tool_name}' execution error: {exc}"
+                            )
                 else:
                     # Fallback when no tool registry
                     result["output"] = (
