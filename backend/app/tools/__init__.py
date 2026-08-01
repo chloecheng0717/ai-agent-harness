@@ -5,7 +5,8 @@ This package contains the tool system implementations:
 - Base: Abstract base class for all tools
 - Registry: Tool registration and discovery
 - Plugins: Tool implementations (API, file, web search, code execution)
-- CTF tools: FileTool, StringsTool, PythonTool, EncodingTool
+- CTF tools: FileTool, StringsTool, PythonTool, EncodingTool, ArchiveTool
+- Helpers: Archive extraction logic shared with the sandbox
 
 Tools are plugins that agents can use to interact with external systems
 and perform specific operations.
@@ -21,6 +22,7 @@ from app.tools.plugins import (
     StringsTool,
     PythonTool,
     EncodingTool,
+    ArchiveTool,
 )
 
 __all__ = [
@@ -33,4 +35,5 @@ __all__ = [
     "StringsTool",
     "PythonTool",
     "EncodingTool",
+    "ArchiveTool",
 ]
