@@ -221,6 +221,7 @@ class ChallengeResult:
     errors: list[str]
     expected_flag: str
     final_answer: str
+    llm_unavailable: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -238,6 +239,7 @@ class ChallengeResult:
             "errors": self.errors,
             "expected_flag": self.expected_flag,
             "final_answer": self.final_answer[:500],
+            "llm_unavailable": self.llm_unavailable,
         }
 
 
@@ -299,6 +301,10 @@ class BenchmarkReport:
         return sum(1 for r in self.results if r.passed)
 
     @property
+    def llm_unavailable_count(self) -> int:
+        return sum(1 for r in self.results if r.llm_unavailable)
+
+    @property
     def total_time_ms(self) -> float:
         return sum(r.execution_time_ms for r in self.results)
 
@@ -331,7 +337,8 @@ class BenchmarkReport:
         return {
             "total_challenges": len(self.results),
             "passed": self.passed_count,
-            "failed": len(self.results) - self.passed_count,
+            "failed": len(self.results) - self.passed_count - self.llm_unavailable_count,
+            "llm_unavailable": self.llm_unavailable_count,
             "success_rate": round(self.success_rate, 3),
             "total_time_ms": round(self.total_time_ms, 2),
             "total_iterations": self.total_iterations,

@@ -28,10 +28,14 @@ from app.models.llm import (
     LLMProviderType,
     LLMRateLimitError,
     LLMTimeoutError,
+    LLMUnavailableError,
     ModelInfo,
     TokenUsageInfo,
 )
-from app.models.providers.openai_provider import OpenAIProvider
+from app.models.providers.openai_provider import (
+    OpenAIProvider,
+    is_daily_quota_exceeded,
+)
 
 
 # ── Data model tests ─────────────────────────────────────────────
@@ -363,6 +367,60 @@ class TestOpenAIProviderChatCompletion:
             assert client.post.call_count == 2
 
     @pytest.mark.asyncio
+    async def test_daily_quota_429_raises_unavailable_without_retry(self) -> None:
+        provider = self._make_provider()
+        provider.config.max_retries = 3
+        mock_response = self._mock_response(
+            status_code=429,
+            text=(
+                '{"error": {"code": 429, "message": "Rate limit exceeded: '
+                'free-models-per-day. Add 10 credits to unlock 1000 free model '
+                'requests per day", "metadata": {"error_type": '
+                '"rate_limit_exceeded"}}}'
+            ),
+        )
+
+        with patch.object(provider, "_get_client") as mock_get:
+            client = AsyncMock()
+            client.post = AsyncMock(return_value=mock_response)
+            mock_get.return_value = client
+
+            req = ChatCompletionRequest(
+                messages=[ChatMessage(role="user", content="Hi")]
+            )
+            with pytest.raises(LLMUnavailableError):
+                await provider.chat_completion(req)
+            assert client.post.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_transient_429_recovers_after_retry(self) -> None:
+        provider = self._make_provider()
+        provider.config.max_retries = 3
+        rate_limited = self._mock_response(status_code=429, text="Rate limited")
+        success = self._mock_response()
+
+        call_count = 0
+
+        async def side_effect(*args: Any, **kwargs: Any) -> httpx.Response:
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return rate_limited
+            return success
+
+        with patch.object(provider, "_get_client") as mock_get:
+            client = AsyncMock()
+            client.post = AsyncMock(side_effect=side_effect)
+            mock_get.return_value = client
+
+            req = ChatCompletionRequest(
+                messages=[ChatMessage(role="user", content="Hi")]
+            )
+            resp = await provider.chat_completion(req)
+            assert resp.content == "Hello there!"
+            assert call_count == 2
+
+    @pytest.mark.asyncio
     async def test_server_error_retries(self) -> None:
         provider = self._make_provider()
         provider.config.max_retries = 3
@@ -525,3 +583,20 @@ class TestOpenAIProviderParseResponse:
         assert resp.usage.total_tokens == 150
         assert "created" not in resp.metadata
         assert resp.metadata.get("object") == "chat.completion"
+
+
+class TestIsDailyQuotaExceeded:
+    def test_detects_openrouter_free_model_message(self) -> None:
+        body = (
+            '{"error": {"code": 429, "message": "Rate limit exceeded: '
+            'free-models-per-day. Add 10 credits to unlock 1000 free model '
+            'requests per day", "metadata": {"error_type": '
+            '"rate_limit_exceeded"}}}'
+        )
+        assert is_daily_quota_exceeded(body) is True
+
+    def test_ignores_transient_rate_limit(self) -> None:
+        assert is_daily_quota_exceeded("Rate limited") is False
+
+    def test_ignores_empty_body(self) -> None:
+        assert is_daily_quota_exceeded("") is False

@@ -25,7 +25,7 @@ from typing import Any
 import structlog
 
 from app.agents.core.orchestrator import Orchestrator
-from app.models.llm import ChatMessage
+from app.models.llm import ChatMessage, LLMUnavailableError
 from app.models.state import AgentState, PlanStep
 
 
@@ -227,6 +227,8 @@ class BenchmarkOrchestrator(Orchestrator):
                     for i, item in enumerate(plan_data)
                 ]
                 state.metadata["plan_source"] = "benchmark_llm"
+        except LLMUnavailableError:
+            raise
         except Exception as exc:
             self.logger.warning(
                 "LLM plan parsing failed, falling back to base planner",

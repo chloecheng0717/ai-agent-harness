@@ -39,6 +39,7 @@ from app.models.llm import (
     ChatCompletionResponse,
     ChatMessage,
     LLMProviderConfig,
+    LLMUnavailableError,
     ModelInfo,
     TokenUsageInfo,
 )
@@ -112,6 +113,26 @@ class _StubProvider(BaseLLMProvider):
 
     async def get_model_info(self) -> ModelInfo:
         return ModelInfo(model_name="benchmark-stub")
+
+
+class _UnavailableProvider(BaseLLMProvider):
+    """Provider that fails the first LLM call with LLMUnavailableError."""
+
+    def __init__(self) -> None:
+        super().__init__(LLMProviderConfig(model="unavailable-stub"))
+
+    async def chat_completion(
+        self,
+        request: ChatCompletionRequest,
+    ) -> ChatCompletionResponse:
+        raise LLMUnavailableError(
+            "LLM unavailable (daily quota exceeded 429)",
+            provider=self.config.provider_type.value,
+            status_code=429,
+        )
+
+    async def get_model_info(self) -> ModelInfo:
+        return ModelInfo(model_name="unavailable-stub")
 
 
 # ── Simulated container ───────────────────────────────────────────
@@ -540,6 +561,67 @@ class TestBenchmarkRunnerPassesChallenges:
         for result in results:
             assert result.name in {c.name for c in challenges}
             assert result.failed_step is None if result.passed else True
+
+
+class TestBenchmarkLLMUnavailable:
+    @pytest.mark.asyncio
+    async def test_challenge_reports_llm_unavailable(
+        self, workspace_dir: str
+    ) -> None:
+        challenge = get_challenge("encoding_base64")
+        sandbox = _make_sandbox(workspace_dir)
+        runner = BenchmarkRunner(
+            settings=None,
+            sandbox=sandbox,
+            llm_provider=_UnavailableProvider(),
+            max_iterations=3,
+        )
+
+        with _patched_client(sandbox):
+            result: ChallengeResult = await runner.run_challenge(challenge)
+
+        assert result.llm_unavailable is True
+        assert result.passed is False
+        assert result.flag_found is False
+        assert result.status == "llm_unavailable"
+        assert any("quota" in e for e in result.errors)
+
+    @pytest.mark.asyncio
+    async def test_run_challenges_stops_on_llm_unavailable(
+        self, workspace_dir: str
+    ) -> None:
+        sandbox = _make_sandbox(workspace_dir)
+        runner = BenchmarkRunner(
+            settings=None,
+            sandbox=sandbox,
+            llm_provider=_UnavailableProvider(),
+            max_iterations=3,
+        )
+
+        with _patched_client(sandbox):
+            results = await runner.run_challenges(build_all_challenges())
+
+        assert len(results) == 1
+        assert results[0].llm_unavailable is True
+
+    @pytest.mark.asyncio
+    async def test_report_excludes_unavailable_from_success_rate(
+        self, workspace_dir: str
+    ) -> None:
+        sandbox = _make_sandbox(workspace_dir)
+        runner = BenchmarkRunner(
+            settings=None,
+            sandbox=sandbox,
+            llm_provider=_UnavailableProvider(),
+            max_iterations=3,
+        )
+
+        with _patched_client(sandbox):
+            results = await runner.run_challenges(build_all_challenges())
+
+        report = BenchmarkReport(results=results)
+        assert report.llm_unavailable_count == 1
+        assert report.passed_count == 0
 
 
 class TestSimulatedContainer:

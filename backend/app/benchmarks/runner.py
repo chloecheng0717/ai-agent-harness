@@ -167,6 +167,29 @@ class BenchmarkRunner:
             }
         duration_ms = (time.monotonic() - start) * 1000
 
+        if result.get("llm_unavailable"):
+            self.logger.warning(
+                "Challenge skipped: LLM unavailable",
+                challenge=challenge.name,
+            )
+            return ChallengeResult(
+                name=challenge.name,
+                category=challenge.category,
+                difficulty=challenge.difficulty,
+                passed=False,
+                flag_found=False,
+                status="llm_unavailable",
+                failed_step=None,
+                milestones=[],
+                tools_used=[],
+                execution_time_ms=duration_ms,
+                iterations=0,
+                errors=list(result.get("errors", [])),
+                expected_flag=challenge.expected_flag,
+                final_answer="",
+                llm_unavailable=True,
+            )
+
         trace = RunTrace(
             tool_calls=result.get("benchmark_trace", []),
             workspace_files=result.get("benchmark_workspace_files", []),
@@ -215,5 +238,13 @@ class BenchmarkRunner:
                 challenge=challenge.name,
                 difficulty=challenge.difficulty,
             )
-            results.append(await self.run_challenge(challenge))
+            result = await self.run_challenge(challenge)
+            results.append(result)
+            if result.llm_unavailable:
+                self.logger.warning(
+                    "Stopping benchmark: LLM unavailable",
+                    challenge=challenge.name,
+                    remaining=len(challenges) - len(results),
+                )
+                break
         return results

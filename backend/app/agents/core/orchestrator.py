@@ -27,6 +27,7 @@ from app.models.llm import (
     ChatCompletionRequest,
     ChatMessage,
     LLMProviderError,
+    LLMUnavailableError,
 )
 from app.models.state import (
     AgentState,
@@ -339,6 +340,15 @@ class Orchestrator:
             state = await self._run_step(LifecycleStep.REFLECT, state)
             state = await self._run_step(LifecycleStep.RESPOND, state)
 
+        except LLMUnavailableError as exc:
+            state.status = StepStatus.FAILED
+            state.add_error(str(exc))
+            state.metadata["llm_unavailable"] = True
+            self.logger.error(
+                "Lifecycle aborted: LLM unavailable",
+                task_id=str(state.task_id),
+                error=str(exc),
+            )
         except RetryExhaustedError as exc:
             state.status = StepStatus.FAILED
             state.add_error(str(exc))
@@ -371,7 +381,10 @@ class Orchestrator:
         )
 
         await self.close()
-        return state.to_result()
+        result = state.to_result()
+        if state.metadata.get("llm_unavailable"):
+            result["llm_unavailable"] = True
+        return result
 
     # ── step runner with retry ───────────────────────────────
 
@@ -462,6 +475,17 @@ class Orchestrator:
                     ms=round(ms, 2),
                 )
                 return state
+
+            except LLMUnavailableError as exc:
+                ms = (time.monotonic() - step_start) * 1000
+                state.record_step(step, StepStatus.FAILED, error=str(exc))
+                self.logger.error(
+                    "Step aborted: LLM unavailable",
+                    step=step.value,
+                    error=str(exc),
+                    ms=round(ms, 2),
+                )
+                raise
 
             except Exception as exc:
                 ms = (time.monotonic() - step_start) * 1000
@@ -555,6 +579,8 @@ class Orchestrator:
                 goal = await self._llm_chat(messages, state)
                 if goal.strip():
                     state.goal = goal.strip()
+            except LLMUnavailableError:
+                raise
             except Exception:
                 self.logger.warning("LLM understand_task failed, falling back to raw message")
                 state.goal = user_messages[-1].content
@@ -619,6 +645,8 @@ class Orchestrator:
                         "PlannerAgent failed",
                         errors=result.get("errors", []),
                     )
+            except LLMUnavailableError:
+                raise
             except Exception as exc:
                 self.logger.warning(
                     "PlannerAgent raised exception, falling back",
@@ -653,6 +681,8 @@ class Orchestrator:
                     ]
                     state.metadata["plan_source"] = "orchestrator_llm"
                     return state
+            except LLMUnavailableError:
+                raise
             except Exception:
                 self.logger.warning("LLM create_plan failed, using fallback plan")
 
@@ -869,6 +899,8 @@ class Orchestrator:
                 self._set_task_complete_from_eval(state, evaluation)
                 if not state.metadata.get("task_complete"):
                     state.metadata["replan_feedback"] = evaluation
+            except LLMUnavailableError:
+                raise
             except Exception:
                 self.logger.warning("LLM evaluate_result failed, using heuristic")
                 self._evaluate_heuristic(state)
@@ -949,6 +981,8 @@ class Orchestrator:
                 reflection = await self._llm_chat(messages, state)
                 if reflection:
                     state.metadata["reflection"] = reflection
+            except LLMUnavailableError:
+                raise
             except Exception:
                 self.logger.warning("LLM reflect failed, logging summary only")
 
@@ -1015,6 +1049,8 @@ class Orchestrator:
             try:
                 answer = await self._llm_chat(messages, state)
                 state.final_answer = answer.strip() if answer and answer.strip() else self._fallback_answer(state)
+            except LLMUnavailableError:
+                raise
             except Exception:
                 self.logger.warning("LLM respond failed, concatenating results")
                 state.final_answer = self._fallback_answer(state)

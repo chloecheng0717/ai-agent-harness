@@ -113,6 +113,17 @@ class LLMRateLimitError(LLMProviderError):
     """Raised when the provider returns a rate-limit (429) response."""
 
 
+class LLMUnavailableError(LLMRateLimitError):
+    """
+    Raised when the provider is effectively unavailable for the request.
+
+    Used for unrecoverable quota exhaustion such as OpenRouter's free-model
+    daily quota (HTTP 429).  Unlike a transient ``LLMRateLimitError`` this
+    error must not be retried — retrying only wastes quota and cannot succeed
+    until the limit resets.
+    """
+
+
 class LLMAuthenticationError(LLMProviderError):
     """Raised when the provider returns an authentication (401) response."""
 

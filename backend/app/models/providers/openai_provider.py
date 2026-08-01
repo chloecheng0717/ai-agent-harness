@@ -28,11 +28,42 @@ from app.models.llm import (
     LLMProviderType,
     LLMRateLimitError,
     LLMTimeoutError,
+    LLMUnavailableError,
     ModelInfo,
     TokenUsageInfo,
 )
 
 logger = structlog.get_logger().bind(component="llm_provider")
+
+#: Phrases in a 429 error body that indicate an unrecoverable quota
+#: condition (e.g. OpenRouter's free-model daily limit) rather than a
+#: transient rate limit.  Retrying these wastes quota and cannot succeed
+#: until the account/plan changes, so they are surfaced as
+#: :class:`LLMUnavailableError` instead of being retried.
+_QUOTA_EXCEEDED_MARKERS = (
+    "free-models-per-day",
+    "free model",
+    "free tier",
+    "daily limit",
+    "daily quota",
+    "quota exceeded",
+    "insufficient credits",
+    "not have enough credits",
+    "per day",
+)
+
+
+def is_daily_quota_exceeded(body: str) -> bool:
+    """
+    Whether a 429 error body signals an exhausted daily quota.
+
+    OpenRouter rejects free-model requests with messages such as
+    ``Rate limit exceeded: free-models-per-day. Add 10 credits to unlock
+    1000 free model requests per day`` when the daily allowance is spent.
+    Transient 429s (per-minute throttling, provider overload) do not match.
+    """
+    lowered = body.lower()
+    return any(marker in lowered for marker in _QUOTA_EXCEEDED_MARKERS)
 
 
 class OpenAIProvider(BaseLLMProvider):
@@ -127,8 +158,11 @@ class OpenAIProvider(BaseLLMProvider):
         ------
         LLMAuthenticationError
             If the API key is invalid (401).
+        LLMUnavailableError
+            If a 429 indicates an unrecoverable quota condition (e.g.
+            OpenRouter free-model daily limit).  Never retried.
         LLMRateLimitError
-            If retries for 429 are exhausted.
+            If retries for a transient 429 are exhausted.
         LLMProviderError
             On other HTTP errors or malformed responses.
         """
@@ -158,6 +192,17 @@ class OpenAIProvider(BaseLLMProvider):
 
                 if http_response.status_code == 429:
                     error_body = http_response.text
+                    if is_daily_quota_exceeded(error_body):
+                        self.logger.error(
+                            "Daily quota exceeded, not retrying",
+                            attempt=attempt,
+                            body=error_body,
+                        )
+                        raise LLMUnavailableError(
+                            f"LLM unavailable (daily quota exceeded 429): {error_body}",
+                            provider=self.config.provider_type.value,
+                            status_code=429,
+                        )
                     self.logger.warning(
                         "Rate limited",
                         attempt=attempt,

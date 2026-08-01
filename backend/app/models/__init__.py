@@ -38,6 +38,7 @@ from app.models.llm import (
     TokenUsageInfo,
     LLMProviderError,
     LLMRateLimitError,
+    LLMUnavailableError,
     LLMAuthenticationError,
     LLMTimeoutError,
 )
@@ -105,6 +106,7 @@ __all__ = [
     "TokenUsageInfo",
     "LLMProviderError",
     "LLMRateLimitError",
+    "LLMUnavailableError",
     "LLMAuthenticationError",
     "LLMTimeoutError",
 

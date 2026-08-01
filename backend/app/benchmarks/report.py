@@ -44,13 +44,14 @@ def render_result_table(results: list[ChallengeResult]) -> str:
     for r in results:
         tools = ",".join(r.tools_used) or "-"
         failed = r.failed_step or "-"
+        passed = "N/A" if r.llm_unavailable else ("PASS" if r.passed else "FAIL")
         lines.append(
             _row(
                 [
                     r.name,
                     r.category,
                     r.difficulty,
-                    "PASS" if r.passed else "FAIL",
+                    passed,
                     r.status,
                     failed,
                     tools,
@@ -70,13 +71,15 @@ def render_summary(report: BenchmarkReport) -> str:
         "================",
         f"  Challenges:       {len(report.results)}",
         f"  Passed:           {report.passed_count}",
-        f"  Failed:           {len(report.results) - report.passed_count}",
+        f"  Failed:           {len(report.results) - report.passed_count - report.llm_unavailable_count}",
         f"  Success rate:     {report.success_rate:.0%}",
         f"  Total time:       {report.total_time_ms:.0f} ms",
         f"  Total iterations: {report.total_iterations}",
         "",
         "  Tools used (by number of challenges):",
     ]
+    if report.llm_unavailable_count:
+        lines.insert(3, f"  LLM unavailable:  {report.llm_unavailable_count}")
     for entry in report.tool_frequency():
         lines.append(
             f"    {entry['tool']:<10} {entry['challenges']} challenge(s)"

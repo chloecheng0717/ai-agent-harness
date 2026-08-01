@@ -27,6 +27,7 @@ from app.models.llm import (
     ChatCompletionRequest,
     ChatMessage,
     LLMProviderError,
+    LLMUnavailableError,
 )
 from app.models.state import PlanStep
 
@@ -319,6 +320,8 @@ class PlannerAgent(BaseAgent):
             if steps:
                 return steps
             self.logger.warning("LLM returned empty/unparseable plan, falling back")
+        except LLMUnavailableError:
+            raise
         except LLMProviderError as exc:
             self.logger.error("LLM planning failed", error=str(exc))
         except Exception as exc:
@@ -385,6 +388,8 @@ class PlannerAgent(BaseAgent):
                         step_count=len(steps),
                     )
                     return self._refine_plan(steps, available)
+            except LLMUnavailableError:
+                raise
             except Exception as exc:
                 self.logger.warning(
                     "Revision attempt failed",
