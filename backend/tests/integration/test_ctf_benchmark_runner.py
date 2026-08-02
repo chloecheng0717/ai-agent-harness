@@ -620,7 +620,7 @@ class TestBenchmarkRunnerPassesChallenges:
             results = await runner.run_challenges(challenges)
 
         report = BenchmarkReport(results=results)
-        assert len(results) == 7
+        assert len(results) == 8
         assert 0.0 < report.success_rate <= 1.0
         assert report.total_time_ms >= 0
         for result in results:

@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 #: Flag-like token used for display, not for pass/fail (exact match wins).
-DEFAULT_FLAG_PATTERN = re.compile(r"(?:flag|ctf)\{[^\}]+\}", re.IGNORECASE)
+DEFAULT_FLAG_PATTERN = re.compile(r"(?:flag|ctf|academy)\{[^\}]+\}", re.IGNORECASE)
 
 
 # ── Evidence ──────────────────────────────────────────────────────

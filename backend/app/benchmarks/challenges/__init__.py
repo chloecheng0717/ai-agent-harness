@@ -21,6 +21,7 @@ from app.benchmarks.challenges.file_analysis import (
     build_file_analysis_strings,
 )
 from app.benchmarks.challenges.multi_step import build_multi_step
+from app.benchmarks.challenges.network import build_perceptron
 from app.benchmarks.models import Challenge
 
 
@@ -34,6 +35,7 @@ def build_all_challenges() -> list[Challenge]:
         build_file_analysis_strings(),
         build_file_analysis_hidden(),
         build_multi_step(),
+        build_perceptron(),
     ]
 
 
@@ -61,4 +63,5 @@ CHALLENGE_BUILDERS: list[tuple[str, str]] = [
     ("file_analysis_strings", build_file_analysis_strings),
     ("file_analysis_hidden", build_file_analysis_hidden),
     ("multi_step", build_multi_step),
+    ("perceptron_play_naught", build_perceptron),
 ]

@@ -44,7 +44,7 @@ from app.benchmarks.models import (
     evaluate_challenge,
 )
 
-FLAG_PATTERN = re.compile(r"(?:flag|ctf)\{[^\}]+\}", re.IGNORECASE)
+FLAG_PATTERN = re.compile(r"(?:flag|ctf|academy)\{[^\}]+\}", re.IGNORECASE)
 
 
 # ── Reference solvers ─────────────────────────────────────────────
@@ -87,6 +87,11 @@ def _reference_flag(challenge: Challenge) -> str:
             if "flag{" in decoded:
                 return decoded
         raise AssertionError("multi_step flag not recoverable from payload strings")
+    if challenge.name == "perceptron_play_naught":
+        # Remote network challenge: the ground truth is defined by the live
+        # service, not derivable from local seed files.  The unit suite must
+        # stay offline, so the reference is the challenge's own flag value.
+        return challenge.expected_flag
     raise AssertionError(f"no reference solver for {challenge.name}")
 
 
@@ -134,11 +139,11 @@ class TestHelpers:
 
 
 class TestChallengeRegistry:
-    def test_build_all_returns_seven_unique_challenges(self) -> None:
+    def test_build_all_returns_unique_challenges(self) -> None:
         challenges = build_all_challenges()
-        assert len(challenges) == 7
+        assert len(challenges) == 8
         names = [c.name for c in challenges]
-        assert len(set(names)) == 7
+        assert len(set(names)) == 8
         for challenge in challenges:
             assert challenge.name
             assert challenge.category
@@ -153,7 +158,13 @@ class TestChallengeRegistry:
             assert FLAG_PATTERN.fullmatch(challenge.expected_flag), challenge.name
 
     def test_challenge_categories(self) -> None:
-        assert challenge_categories() == ["encoding", "archive", "file_analysis", "multi_step"]
+        assert challenge_categories() == [
+            "encoding",
+            "archive",
+            "file_analysis",
+            "multi_step",
+            "network",
+        ]
 
     def test_get_challenge_lookup(self) -> None:
         assert get_challenge("encoding_base64").name == "encoding_base64"

@@ -71,7 +71,7 @@ StepFn = Callable[[AgentState], Coroutine[Any, Any, AgentState]]
 #: A recovered flag-like token means the objective is done.  Used to
 #: hard-confirm completion from real tool output regardless of the LLM
 #: evaluator's verdict.
-_FLAG_PATTERN_RE = re.compile(r"(?:flag|ctf)\{[^\}]+\}", re.IGNORECASE)
+_FLAG_PATTERN_RE = re.compile(r"(?:flag|ctf|academy)\{[^\}]+\}", re.IGNORECASE)
 
 #: A token that is entirely base64 (with padding, or containing the
 #: distinctive ``+``/``/`` characters) is still encoded content.

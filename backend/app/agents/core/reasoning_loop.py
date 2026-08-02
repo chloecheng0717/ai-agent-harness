@@ -19,6 +19,7 @@ from app.config import get_settings
 DEFAULT_FLAG_PATTERNS: List[str] = [
     r"flag\{[^\}]+\}",
     r"CTF\{[^\}]+\}",
+    r"academy\{[^\}]+\}",
 ]
 
 
