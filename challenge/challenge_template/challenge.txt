@@ -1,0 +1,21 @@
+Title:
+Secret of the Polyglot
+
+Category:
+Forensics
+
+Points:
+100
+
+Description:
+Someone gave me this file and said it contains a secret. Can you find the flag?
+
+Hints:
+- Files can have more than one format.
+- Check the file carefully.
+
+Challenge URL:
+https://play.picoctf.org/practice/challenge/123
+
+Files:
+polyglot.png
