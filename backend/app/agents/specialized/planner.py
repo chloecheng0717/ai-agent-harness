@@ -78,6 +78,17 @@ Rules:
 - Keep the plan as concise as possible (aim for 2-8 steps).
 - Every step MUST have a non-empty description.
 - If no tool is required, set tool_name to null and tool_parameters to {}.
+
+Tool guidance:
+- Use 'strings' to extract hidden/embedded/printable text from files, logs,
+  and binaries.  Prefer it whenever the goal is finding hidden text inside
+  a file.
+- Use 'file' ONLY to inspect a file's type or metadata (MIME type, magic
+  bytes).  Never use it as the only step when the goal is to recover
+  hidden content.
+- Decode encoded data ONE layer per step; if a decode still yields encoded
+  text (hex, base64, URL escapes), add a step for the next layer.
+- Keep planning until the flag text (matching 'flag{...}') is recovered.
 """
 
 _REVISE_SYSTEM_PROMPT = """\
@@ -673,29 +684,32 @@ class PlannerAgent(BaseAgent):
         """
         Deterministically assign tools to plan steps.
 
-        An explicit available tool name is kept; otherwise the
-        :class:`ToolSelector` picks the best match from the step's
-        description, rationale, and expected output.  Steps referencing a
-        tool that is not available are downgraded to reasoning steps.
+        An explicit available tool name is kept unless the
+        :class:`ToolSelector` determines a more dedicated tool applies
+        (e.g. ``strings`` for steps that extract hidden text from a file
+        even when the LLM named ``file``).  Otherwise the selector picks
+        the best match from the step's description, rationale, and expected
+        output.  Steps referencing a tool that is not available are
+        downgraded to reasoning steps.
         """
         available = list(tools_available)
         for step in steps:
             current = step.tool_name
-            if current and current in available:
-                continue
             best = self.tool_selector.select_for_step(step, available)
-            if best is not None:
+            if best is None:
+                if current and current not in available:
+                    self.logger.warning(
+                        "Step references unavailable tool",
+                        tool_name=current,
+                        step_index=step.index,
+                    )
+                    step.tool_name = None
+                    step.tool_parameters = {}
+                continue
+            if best != current:
                 step.tool_name = best
                 if not step.estimated_tools:
                     step.estimated_tools = [best]
-            elif current and current not in available:
-                self.logger.warning(
-                    "Step references unavailable tool",
-                    tool_name=current,
-                    step_index=step.index,
-                )
-                step.tool_name = None
-                step.tool_parameters = {}
 
     def _dedupe_steps(self, steps: list[PlanStep]) -> None:
         """

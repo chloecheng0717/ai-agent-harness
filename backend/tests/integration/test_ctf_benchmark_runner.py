@@ -115,6 +115,71 @@ class _StubProvider(BaseLLMProvider):
         return ModelInfo(model_name="benchmark-stub")
 
 
+class _IterativePlanProvider(BaseLLMProvider):
+    """Provider that scripts planning across multiple iterations.
+
+    Returns a distinct plan for each planning call (in order) and, when
+    ``lazy_evaluator`` is set, always answers ``COMPLETE: YES`` regardless
+    of the actual results.  This forces the deterministic completion guard
+    to be the only thing preventing an early stop while the tool output is
+    still encoded.
+    """
+
+    def __init__(
+        self,
+        plans: list[list[dict[str, Any]]],
+        lazy_evaluator: bool = False,
+    ) -> None:
+        super().__init__(LLMProviderConfig(model="benchmark-stub"))
+        self.plans = list(plans)
+        self.lazy_evaluator = lazy_evaluator
+
+    async def chat_completion(
+        self,
+        request: ChatCompletionRequest,
+    ) -> ChatCompletionResponse:
+        system = next(
+            (m.content for m in request.messages if m.role == "system"),
+            "",
+        )
+        user = next(
+            (m.content for m in request.messages if m.role == "user"),
+            "",
+        )
+
+        if "planning agent" in system:
+            plan = self.plans.pop(0) if self.plans else []
+            content = json.dumps(plan)
+        elif "execution evaluator" in system:
+            content = (
+                "COMPLETE: YES"
+                if self.lazy_evaluator or FLAG_PATTERN.search(user)
+                else "COMPLETE: NO"
+            )
+        elif "reflective agent" in system:
+            content = "Reflection recorded for the run."
+        elif "helpful assistant" in system:
+            match = FLAG_PATTERN.search(user)
+            content = match.group(0) if match else "No flag recovered."
+        elif "task analyst" in system:
+            content = user.strip()
+        else:
+            content = ""
+
+        return ChatCompletionResponse(
+            model="benchmark-stub",
+            choices=[
+                ChatCompletionChoice(
+                    message=ChatMessage(role="assistant", content=content)
+                )
+            ],
+            usage=TokenUsageInfo(prompt_tokens=1, completion_tokens=1),
+        )
+
+    async def get_model_info(self) -> ModelInfo:
+        return ModelInfo(model_name="benchmark-stub")
+
+
 class _UnavailableProvider(BaseLLMProvider):
     """Provider that fails the first LLM call with LLMUnavailableError."""
 
@@ -561,6 +626,122 @@ class TestBenchmarkRunnerPassesChallenges:
         for result in results:
             assert result.name in {c.name for c in challenges}
             assert result.failed_step is None if result.passed else True
+
+    @pytest.mark.asyncio
+    async def test_encoding_multilayer_keeps_decoding_until_flag(
+        self, workspace_dir: str
+    ) -> None:
+        """The guard forces a second iteration instead of stopping after the
+        first decode, even when the evaluator lazily reports COMPLETE: YES."""
+        challenge = get_challenge("encoding_multilayer")
+        plans = [
+            [
+                # Iteration 1: unwraps only the outer base64 → output is hex.
+                {
+                    "index": 0,
+                    "description": "Read the wrapped message",
+                    "tool_name": "python",
+                    "rationale": "The payload is stored as text in the workspace.",
+                    "tool_parameters": {
+                        "code": "print(open('/workspace/deep.txt').read().strip())"
+                    },
+                },
+                {
+                    "index": 1,
+                    "description": "Decode the first base64 layer",
+                    "tool_name": "python",
+                    "rationale": "Unwrap the outer base64 encoding.",
+                    "tool_parameters": {
+                        "code": (
+                            "import base64\n"
+                            "outer = open('/workspace/deep.txt').read().strip()\n"
+                            "print(base64.b64decode(outer).decode())\n"
+                        )
+                    },
+                },
+            ],
+            [
+                # Iteration 2: decodes the remaining hex layer → flag.
+                {
+                    "index": 0,
+                    "description": "Decode the remaining hex layer",
+                    "tool_name": "python",
+                    "rationale": "The first layer revealed hex, decode it to the flag.",
+                    "tool_parameters": {
+                        "code": (
+                            "import base64\n"
+                            "outer = open('/workspace/deep.txt').read().strip()\n"
+                            "inner = base64.b64decode(outer).decode()\n"
+                            "print(bytes.fromhex(inner).decode())\n"
+                        )
+                    },
+                },
+            ],
+        ]
+        sandbox = _make_sandbox(workspace_dir)
+        runner = BenchmarkRunner(
+            settings=None,
+            sandbox=sandbox,
+            llm_provider=_IterativePlanProvider(plans, lazy_evaluator=True),
+            max_iterations=2,
+        )
+
+        with _patched_client(sandbox):
+            result: ChallengeResult = await runner.run_challenge(challenge)
+
+        assert result.passed is True, result.errors
+        assert result.status == "completed"
+        assert result.failed_step is None
+        assert [m["passed"] for m in result.milestones] == [True, True, True, True]
+        assert result.iterations == 2
+        assert result.final_answer == challenge.expected_flag
+
+    @pytest.mark.asyncio
+    async def test_file_analysis_hidden_requires_strings_tool(
+        self, workspace_dir: str
+    ) -> None:
+        """The hidden-string milestone only passes when StringsTool is used."""
+        challenge = get_challenge("file_analysis_hidden")
+        plan = [
+            {
+                "index": 0,
+                "description": "Extract printable strings from the log",
+                "tool_name": "strings",
+                "rationale": "The flag is hidden among decoy tokens in the log.",
+                "tool_parameters": {"path": "/workspace/logs.bin"},
+            },
+            {
+                "index": 1,
+                "description": "Recover the flag from the extracted strings",
+                "tool_name": "python",
+                "rationale": "Scan the log for the real flag token.",
+                "tool_parameters": {
+                    "code": (
+                        "import re\n"
+                        "data = open('/workspace/logs.bin', 'rb').read()\n"
+                        "match = re.search(rb'(?:flag|ctf)\\{[^\\}]+\\}', data)\n"
+                        "print(match.group(0).decode())\n"
+                    )
+                },
+            },
+        ]
+        sandbox = _make_sandbox(workspace_dir)
+        runner = BenchmarkRunner(
+            settings=None,
+            sandbox=sandbox,
+            llm_provider=_StubProvider(plan),
+            max_iterations=2,
+        )
+
+        with _patched_client(sandbox):
+            result: ChallengeResult = await runner.run_challenge(challenge)
+
+        assert result.passed is True, result.errors
+        assert result.status == "completed"
+        assert result.failed_step is None
+        assert [m["passed"] for m in result.milestones] == [True, True, True]
+        assert "strings" in result.tools_used
+        assert result.final_answer == challenge.expected_flag
 
 
 class TestBenchmarkLLMUnavailable:

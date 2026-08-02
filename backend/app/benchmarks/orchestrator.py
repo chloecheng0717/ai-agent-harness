@@ -194,7 +194,20 @@ class BenchmarkOrchestrator(Orchestrator):
             "for 'archive' provide 'archive_path' (and 'extract_dir' when "
             "useful); for 'file' or 'strings' provide 'path' or 'content'. "
             "Never guess or pad placeholders. Use {} when the step needs no "
-            "tool. Reply with RAW JSON only -- no markdown, no code fences."
+            "tool. Reply with RAW JSON only -- no markdown, no code fences.\n\n"
+            "Tool guidance:\n"
+            "- Use 'strings' to extract hidden/embedded/printable text from "
+            "files, logs, and binaries. Prefer it whenever the goal is to "
+            "find hidden text inside a file.\n"
+            "- Use 'file' ONLY to inspect a file's type or metadata (MIME "
+            "type, magic bytes, signature). Never use it as the only step "
+            "when the goal is to recover hidden content.\n"
+            "- When data is encoded, decode ONE layer per step. If a decode "
+            "still yields encoded-looking text (hex, base64, or URL-escaped), "
+            "add a further step to decode the next layer.\n"
+            "- The task is complete only when the literal flag text (matching "
+            "'flag{...}') is recovered. Keep planning until the flag is "
+            "recovered."
         )
         user_msg = ChatMessage(
             role="user",

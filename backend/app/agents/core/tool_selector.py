@@ -54,15 +54,25 @@ _TOOL_KEYWORDS: dict[str, list[str]] = {
         "ascii",
         "bytes",
         "dump",
+        "hidden",
+        "embedded",
+        "secret",
+        "log",
+        "logs",
     ],
     "file": [
         "file type",
-        "identify",
-        "mime",
         "filetype",
+        "mime",
         "magic bytes",
+        "magic",
         "header",
         "signature",
+        "type of the file",
+        "sniff",
+        "identify the file",
+        "identify file type",
+        "identify filetype",
     ],
     "calculator": [
         "calculate",
@@ -106,6 +116,46 @@ _TOOL_PRIORITY: list[str] = [
     "python",
 ]
 
+#: Tools whose job is metadata inspection or generic execution rather than
+#: extracting hidden content.  These yield to ``strings`` when a step's
+#: wording shows clear string-extraction intent.
+_METADATA_OR_GENERIC_TOOLS = {"file", "python", "web_search"}
+
+#: Wording that marks a step as "pull hidden text out of a file".
+_STRING_EXTRACTION_ACTIONS = (
+    "strings",
+    "printable",
+    "ascii",
+    "extract",
+    "find",
+    "recover",
+    "locate",
+    "search",
+    "look",
+    "reveal",
+    "flag",
+)
+_STRING_HIDDEN_SIGNALS = (
+    "hidden",
+    "hide",
+    "embed",
+    "embedded",
+    "secret",
+    "obfuscated",
+    "concealed",
+    "inside",
+    "among",
+)
+_STRING_FILE_SIGNALS = (
+    "file",
+    "binary",
+    "log",
+    "logs",
+    "blob",
+    "bytes",
+    "dump",
+)
+
 
 class ToolSelector:
     """Select the best available tool for a plan step, deterministically."""
@@ -135,6 +185,20 @@ class ToolSelector:
             The best matching tool name, or ``None`` when no tool fits.
         """
         available = list(available_tools)
+        text = self._step_text(step).lower()
+
+        # 0. String-extraction intent beats metadata/generic tools.
+        #    A step that asks to pull hidden text out of a file, log, or
+        #    binary must use ``strings`` even when the LLM plan named
+        #    ``file`` (type inspection) or ``python`` (generic execution).
+        if "strings" in available and self._string_extraction_intent(text):
+            explicit = self._step_field(step, "tool_name")
+            if explicit is None or explicit in _METADATA_OR_GENERIC_TOOLS:
+                self.logger.debug(
+                    "String-extraction intent selected strings tool",
+                    step_text=text[:120],
+                )
+                return "strings"
 
         # 1. Honour an explicit, available tool name.
         explicit = self._step_field(step, "tool_name")
@@ -147,7 +211,6 @@ class ToolSelector:
                 return estimated
 
         # 3. Keyword scoring against the step's descriptive text.
-        text = self._step_text(step).lower()
         best: str | None = None
         best_score = 0.0
         for tool in _TOOL_PRIORITY:
@@ -159,6 +222,16 @@ class ToolSelector:
             if weighted > best_score:
                 best = tool
                 best_score = weighted
+
+        # 4. Re-check intent against the keyword winner: ``file``/``python``
+        #    should not win a step that is really about extracting content.
+        if (
+            best_score > 0
+            and best in _METADATA_OR_GENERIC_TOOLS
+            and self._string_extraction_intent(text)
+            and "strings" in available
+        ):
+            return "strings"
 
         if best is not None and best_score > 0:
             self.logger.debug(
@@ -192,3 +265,18 @@ class ToolSelector:
         rationale = cls._step_field(step, "rationale", "") or ""
         expected_output = cls._step_field(step, "expected_output", "") or ""
         return " ".join(str(part) for part in (description, rationale, expected_output))
+
+    @classmethod
+    def _string_extraction_intent(cls, text: str) -> bool:
+        """
+        Whether a step's wording asks to pull hidden text out of a file.
+
+        All three signals must be present so ordinary steps (decoding,
+        archiving, type inspection) are never misrouted:
+        an extraction action *and* a hidden-content hint *and* a
+        file-like target.
+        """
+        action = any(kw in text for kw in _STRING_EXTRACTION_ACTIONS)
+        hidden = any(kw in text for kw in _STRING_HIDDEN_SIGNALS)
+        file_like = any(kw in text for kw in _STRING_FILE_SIGNALS)
+        return action and hidden and file_like

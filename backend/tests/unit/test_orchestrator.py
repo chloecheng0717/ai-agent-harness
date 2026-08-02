@@ -425,3 +425,91 @@ class TestIterativeLoop:
         assert result["status"] == "completed"
 
         orch._step_registry[LifecycleStep.EVALUATE_RESULT] = original
+
+
+# ── Deterministic completion guard ────────────────────────────────
+
+
+class TestDeterministicCompletionGuard:
+    """Tests for the completion guard that inspects real tool output.
+
+    The guard must veto an LLM/heuristic ``COMPLETE: YES`` verdict when the
+    tool output is still encoded, and must hard-confirm completion when a
+    flag is recovered even if the evaluator said ``COMPLETE: NO``.
+    """
+
+    def test_guard_blocks_completion_when_output_still_encoded(self) -> None:
+        orch = Orchestrator()
+        state = AgentState()
+        state.results = [
+            {
+                "step_index": 0,
+                "output": {
+                    "stdout": "666c61677b6c61796572735f6f665f656e636f64696e677d"
+                },
+            }
+        ]
+        state.metadata["task_complete"] = True  # lazy evaluator said YES
+
+        orch._enforce_deterministic_completion(state)
+
+        assert state.metadata["task_complete"] is False
+        assert "encoded" in state.metadata.get("replan_feedback", "")
+
+    def test_guard_blocks_completion_when_output_is_base64(self) -> None:
+        orch = Orchestrator()
+        state = AgentState()
+        state.results = [{"step_index": 0, "output": {"stdout": "ZmxhZ3tvbmVfbW9yZV9sYXllcn0="}}]
+        state.metadata["task_complete"] = True
+
+        orch._enforce_deterministic_completion(state)
+
+        assert state.metadata["task_complete"] is False
+        assert state.metadata.get("replan_feedback")
+
+    def test_guard_allows_completion_when_flag_recovered(self) -> None:
+        orch = Orchestrator()
+        state = AgentState()
+        state.results = [
+            {"step_index": 0, "output": {"stdout": "flag{guard_found_me}"}}
+        ]
+        state.metadata["task_complete"] = False  # evaluator said NO
+
+        orch._enforce_deterministic_completion(state)
+
+        assert state.metadata["task_complete"] is True
+
+    def test_guard_allows_completion_for_plain_text(self) -> None:
+        orch = Orchestrator()
+        state = AgentState()
+        state.results = [
+            {
+                "step_index": 0,
+                "output": {"stdout": "All layers decoded. The work is finished."},
+            }
+        ]
+        state.metadata["task_complete"] = True
+
+        orch._enforce_deterministic_completion(state)
+
+        assert state.metadata["task_complete"] is True
+
+    @pytest.mark.asyncio
+    async def test_evaluate_result_guard_overrides_lazy_verdict(self) -> None:
+        """evaluate_result runs the guard after the LLM/heuristic verdict."""
+        orch = Orchestrator()
+        state = AgentState()
+        state.results = [
+            {
+                "step_index": 0,
+                "output": {
+                    "stdout": "666c61677b6c61796572735f6f665f656e636f64696e677d"
+                },
+            }
+        ]
+
+        state = await orch.evaluate_result(state)
+
+        # No LLM provider → heuristic would say complete, guard must veto.
+        assert state.metadata["task_complete"] is False
+        assert state.metadata.get("replan_feedback")

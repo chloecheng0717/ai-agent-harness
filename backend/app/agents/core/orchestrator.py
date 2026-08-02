@@ -15,6 +15,7 @@ with structured logging, exception handling, and retry support.
 
 import asyncio
 import json
+import re
 import time
 from typing import TYPE_CHECKING, Any, Callable, Coroutine, Dict, List, Optional
 
@@ -63,6 +64,69 @@ class RetryExhaustedError(Exception):
 
 # Type alias for async step functions
 StepFn = Callable[[AgentState], Coroutine[Any, Any, AgentState]]
+
+
+# ── deterministic completion heuristics ─────────────────────────
+
+#: A recovered flag-like token means the objective is done.  Used to
+#: hard-confirm completion from real tool output regardless of the LLM
+#: evaluator's verdict.
+_FLAG_PATTERN_RE = re.compile(r"(?:flag|ctf)\{[^\}]+\}", re.IGNORECASE)
+
+#: A token that is entirely base64 (with padding, or containing the
+#: distinctive ``+``/``/`` characters) is still encoded content.
+_ENCODED_BASE64_RE = re.compile(
+    r"^[A-Za-z0-9+/]{8,}={1,2}$|^[A-Za-z0-9+/]{16,}[+/][A-Za-z0-9+/]*$"
+)
+#: A token that is entirely hex and at least 10 bytes long is still
+#: encoded content (e.g. the first decode of a base64-of-hex flag).
+_ENCODED_HEX_RE = re.compile(r"^(?:[0-9a-fA-F]{2}){10,}$")
+#: URL percent-encoding is still encoded content.
+_URL_ESCAPE_RE = re.compile(r"%[0-9a-fA-F]{2}")
+
+_HEX_CHARS = frozenset("0123456789abcdefABCDEF")
+_BASE64_CHARS = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/="
+)
+
+
+def _looks_like_encoded_token(token: str) -> bool:
+    """Whether a single whitespace-free token is predominantly encoded data."""
+    if not token:
+        return False
+    if _ENCODED_BASE64_RE.match(token):
+        return True
+    if _ENCODED_HEX_RE.match(token):
+        return True
+    if _URL_ESCAPE_RE.search(token):
+        return len(_URL_ESCAPE_RE.findall(token)) >= 3
+    return False
+
+
+def _text_looks_encoded(text: str) -> bool:
+    """
+    Whether execution output still looks encoded, compressed, or wrapped.
+
+    Used by :meth:`Orchestrator.evaluate_result` to refuse to declare a
+    task complete while the work product is still base64/hex/URL data or a
+    compression stream.  The check is deliberately conservative: a long,
+    predominantly-alphabetic word or a short hex fragment does not count.
+    """
+    compact = re.sub(r"\s+", "", text)
+    if len(compact) >= 20:
+        hexish = sum(1 for c in compact if c in _HEX_CHARS)
+        if hexish / len(compact) > 0.85 and len(compact) % 2 == 0:
+            return True
+        b64ish = sum(1 for c in compact if c in _BASE64_CHARS)
+        if b64ish / len(compact) > 0.85 and any(
+            marker in compact for marker in ("=", "+", "/")
+        ):
+            return True
+    for line in text.splitlines():
+        token = line.strip()
+        if token and _looks_like_encoded_token(token):
+            return True
+    return False
 
 
 # ── Orchestrator ────────────────────────────────────────────────
@@ -661,8 +725,22 @@ class Orchestrator:
                     "execution plan.\n\n"
                     f"Available tools:\n{tools_desc}\n\n"
                     "Reply with a JSON array of objects, each having 'index' (int), "
-                    "'description' (str), 'tool_name' (str or null), and "
-                    "'rationale' (str). Reply ONLY with the JSON array."
+                    "'description' (str), 'tool_name' (str or null), "
+                    "'rationale' (str), and 'tool_parameters' (object) with the "
+                    "exact arguments that tool needs for that step. "
+                    "Reply ONLY with the JSON array.\n\n"
+                    "Tool guidance:\n"
+                    "- Use 'strings' to extract hidden/embedded/printable text "
+                    "from files, logs, and binaries. Prefer it whenever the goal "
+                    "is to find hidden text inside a file.\n"
+                    "- Use 'file' ONLY to inspect a file's type or metadata. "
+                    "Never use it as the only step when the goal is to recover "
+                    "hidden content.\n"
+                    "- When data is encoded, decode ONE layer per step. If a "
+                    "decode still yields encoded-looking text (hex, base64, or "
+                    "URL-escaped), add a further step to decode the next layer.\n"
+                    "- Keep planning until the flag text (matching 'flag{...}') "
+                    "is recovered."
                 ),
                 ChatMessage(role="user", content=f"Goal: {state.goal}\n\n{self._plan_context(state)}".strip()),
             ]
@@ -907,6 +985,12 @@ class Orchestrator:
         else:
             self._evaluate_heuristic(state)
 
+        # The LLM verdict is a hint, not a contract.  Inspect the REAL tool
+        # output: a recovered flag hard-confirms completion, while output
+        # that is still encoded/compressed means the run must keep going
+        # instead of stopping after the first successful transformation.
+        self._enforce_deterministic_completion(state)
+
         return state
 
     def _set_task_complete_from_eval(self, state: AgentState, evaluation: str) -> None:
@@ -932,6 +1016,62 @@ class Orchestrator:
             state.add_message(
                 "assistant",
                 "Execution completed successfully.",
+            )
+
+    # ── deterministic completion guard ─────────────────────────
+
+    @staticmethod
+    def _result_output_text(result: dict[str, Any]) -> str:
+        """
+        Extract the meaningful text from a single execution result's output.
+
+        Handles the structured output shapes the CTF tools return
+        (``stdout`` from ``python``, ``output`` from ``encoding``, and the
+        ``strings`` list) and plain strings.
+        """
+        output = result.get("output")
+        if isinstance(output, str):
+            return output
+        if isinstance(output, dict):
+            for key in ("stdout", "output", "decoded", "encoded"):
+                value = output.get(key)
+                if isinstance(value, str) and value:
+                    return value
+            strings = output.get("strings")
+            if isinstance(strings, list):
+                return "\n".join(str(s) for s in strings if s)
+        return ""
+
+    def _results_evidence_text(self, state: AgentState) -> str:
+        """Concatenate every real tool output produced this iteration."""
+        return "\n".join(
+            self._result_output_text(result)
+            for result in state.results
+            if self._result_output_text(result)
+        )
+
+    def _enforce_deterministic_completion(self, state: AgentState) -> None:
+        """
+        Reconcile the LLM/heuristic completion verdict with the actual tool
+        output so the run neither stops early nor loops forever.
+
+        * When a flag-like token appears in real tool output the task is
+          done, even if the evaluator wrongly said ``COMPLETE: NO``.
+        * When the output is still encoded/compressed (and no flag is
+          present) the task is NOT done, even if the evaluator lazily said
+          ``COMPLETE: YES``; the loop must continue decoding.
+        """
+        evidence = self._results_evidence_text(state)
+        if _FLAG_PATTERN_RE.search(evidence):
+            state.metadata["task_complete"] = True
+            return
+
+        if _text_looks_encoded(evidence):
+            state.metadata["task_complete"] = False
+            state.metadata["replan_feedback"] = (
+                "The latest tool output is still encoded (base64/hex/URL) or "
+                "compressed. Decode or unwrap every remaining layer until the "
+                "flag is revealed, then report it."
             )
 
     async def reflect(self, state: AgentState) -> AgentState:
