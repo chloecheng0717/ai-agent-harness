@@ -302,9 +302,18 @@ class BenchmarkOrchestrator(Orchestrator):
             for record in state.results:
                 status = "OK" if record.get("success") else "FAIL"
                 tool = record.get("tool_name") or "(reasoning)"
+                output = record.get("output")
+                if output is None and record.get("error"):
+                    # A failed step often carries only an error; print it
+                    # instead of the meaningless literal "null".
+                    detail = f"error: {record.get('error')}"
+                elif isinstance(output, dict) and output.get("stdout"):
+                    detail = f"stdout: {output.get('stdout')}"
+                else:
+                    detail = json.dumps(output, default=str)
                 print(
                     f"  [{status}] step {record.get('step_index')}: {tool} "
-                    f"-> {json.dumps(record.get('output'), default=str)[:200]}"
+                    f"-> {detail[:200]}"
                 )
         return state
 

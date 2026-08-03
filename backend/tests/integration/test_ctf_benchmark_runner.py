@@ -29,8 +29,15 @@ from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
+from app.agents.core.challenge_classifier import build_network_plan
 from app.benchmarks.challenges import build_all_challenges, get_challenge
-from app.benchmarks.models import BenchmarkReport, ChallengeResult, RunTrace
+from app.benchmarks.models import (
+    BenchmarkReport,
+    Challenge,
+    ChallengeResult,
+    Milestone,
+    RunTrace,
+)
 from app.benchmarks.runner import BenchmarkRunner
 from app.models.llm import (
     BaseLLMProvider,
@@ -49,7 +56,7 @@ from app.sandbox.docker_sandbox import (
     SandboxConfig,
 )
 
-FLAG_PATTERN = re.compile(r"(?:flag|ctf)\{[^\}]+\}", re.IGNORECASE)
+FLAG_PATTERN = re.compile(r"(?:flag|ctf|academy)\{[^\}]+\}", re.IGNORECASE)
 
 
 # ── Scripted LLM provider ─────────────────────────────────────────
@@ -240,7 +247,7 @@ class _SimulatedContainer:
             self._prepare_archive_params()
             self._run_shell(command)
             self._remap_archive_result()
-        elif command.startswith("python "):
+        elif command.startswith(("python ", "python -u ")):
             self._run_python(command)
         elif command.startswith("strings "):
             self._run_strings(command)
@@ -274,7 +281,8 @@ class _SimulatedContainer:
 
     def _run_python(self, command: str) -> None:
         """Execute a python command, remapping /workspace inside scripts."""
-        rest = command[len("python "):].strip()
+        prefix = "python -u " if command.startswith("python -u ") else "python "
+        rest = command[len(prefix):].strip()
         if not rest.startswith("-c"):
             script_path = rest.strip().strip('"\'')
             if self._workspace_source:
@@ -742,6 +750,118 @@ class TestBenchmarkRunnerPassesChallenges:
         assert [m["passed"] for m in result.milestones] == [True, True, True]
         assert "strings" in result.tools_used
         assert result.final_answer == challenge.expected_flag
+
+    @pytest.mark.asyncio
+    async def test_network_banner_flow_parses_signed_coords_and_persists(
+        self, workspace_dir: str
+    ) -> None:
+        """The deterministic network training step parses signed coords and
+        the weights survive across steps.
+
+        Covers the exact regression that broke the live Perceptron run: the
+        banner step saves ``(+0,-1)``-style points, the training step (real
+        ``_TRAIN_CODE`` from ``build_network_plan``) must parse them, and
+        ``weights.json`` written by that step must be readable by the next
+        step in the same run.
+        """
+        flag = "academy{signed_coords_parsed_persisted}"
+        banner = (
+            "Perceptron Play Naught -- welcome!\n"
+            "Points to classify:\n"
+            "  (+0,-1) => 0\n"
+            "  (+0,+1) => 1\n"
+            "  (+1,-1) => 0\n"
+            "  (-1,+1) => 1\n"
+            "Commands: SET w1 w2 b, SHOW, CHECK\n"
+        )
+        challenge = Challenge(
+            name="network_banner_flow_test",
+            category="network",
+            description="Train a perceptron from a saved banner.",
+            difficulty="easy",
+            goal=(
+                "Parse the labeled training points from /workspace/banner.txt, "
+                "train the perceptron weights, and verify they separate the "
+                "classes."
+            ),
+            expected_flag=flag,
+            required_capabilities=["python"],
+            files={"banner.txt": banner.encode("utf-8")},
+            milestones=[
+                Milestone(
+                    "Parse the signed training points",
+                    # The training step prints "points=4" only when the regex
+                    # accepted the signed (+0,-1) coordinates from the banner.
+                    lambda t: "points=4" in t.tool_output_text()
+                    or t.contains_flag(flag),
+                ),
+                Milestone(
+                    "Train and persist the weights",
+                    lambda t: any(
+                        entry.get("path", "").endswith("weights.json")
+                        for entry in t.workspace_files
+                    )
+                    or t.contains_flag(flag),
+                ),
+                Milestone(
+                    "Recover the flag",
+                    lambda t: t.contains_flag(flag),
+                ),
+            ],
+        )
+
+        train_code = build_network_plan("service.invalid", 1)[1].tool_parameters[
+            "code"
+        ]
+        plan = [
+            {
+                "index": 0,
+                "description": "Parse the banner points and train the perceptron",
+                "tool_name": "python",
+                "rationale": "The banner is already saved in the workspace.",
+                "tool_parameters": {"code": train_code},
+            },
+            {
+                "index": 1,
+                "description": "Verify the weights separate the points",
+                "tool_name": "python",
+                "rationale": (
+                    "Load the persisted weights and confirm every point is "
+                    "classified correctly."
+                ),
+                "tool_parameters": {
+                    "code": (
+                        "import json\n"
+                        "w = json.loads(open('/workspace/weights.json').read())\n"
+                        "points = [((0,-1),0),((0,1),1),((1,-1),0),((-1,1),1)]\n"
+                        "def pred(x, y):\n"
+                        "    return 1 if w['w1']*x + w['w2']*y + w['b'] >= 0 else 0\n"
+                        "ok = all(pred(x, y) == label for (x, y), label in points)\n"
+                        "print('weights_persisted=' + json.dumps(w))\n"
+                        "print('all_separated=' + str(ok))\n"
+                        "if ok:\n"
+                        f"    print('{flag}')\n"
+                    )
+                },
+            },
+        ]
+        sandbox = _make_sandbox(workspace_dir)
+        runner = BenchmarkRunner(
+            settings=None,
+            sandbox=sandbox,
+            llm_provider=_StubProvider(plan),
+            max_iterations=1,
+        )
+
+        with _patched_client(sandbox):
+            result: ChallengeResult = await runner.run_challenge(challenge)
+
+        assert result.passed is True, result.errors
+        assert result.flag_found is True
+        assert result.status == "completed"
+        assert result.failed_step is None
+        assert [m["passed"] for m in result.milestones] == [True, True, True]
+        assert result.final_answer == flag
 
 
 class TestBenchmarkLLMUnavailable:

@@ -305,7 +305,7 @@ class TestPythonTool:
         assert result.output["exit_code"] == 0
         assert result.output["timed_out"] is False
         cmd = sandbox.execute.call_args[0][0]
-        assert "python /workspace/_pt_script.py" in cmd
+        assert "python -u /workspace/_pt_script.py" in cmd
 
     @pytest.mark.asyncio
     async def test_execute_script_path(self) -> None:
@@ -317,7 +317,7 @@ class TestPythonTool:
 
         assert result.success is True
         cmd = sandbox.execute.call_args[0][0]
-        assert "python /workspace/solve.py" in cmd
+        assert "python -u /workspace/solve.py" in cmd
 
     @pytest.mark.asyncio
     async def test_no_input_returns_error(self) -> None:

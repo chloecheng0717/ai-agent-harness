@@ -446,10 +446,16 @@ class TestConfigIntegration:
         assert config.network_disabled is False
 
     def test_sandbox_defaults_match_settings(self) -> None:
-        """Test that SandboxConfig defaults align with Settings defaults."""
+        """Test that SandboxConfig defaults align with Settings defaults.
+
+        The project ``.env`` overrides ``sandbox_network_disabled`` at
+        runtime, so the comparison must use the *code defaults* (env/.env
+        ignored) rather than the ambient environment.  Otherwise this test
+        silently depends on whatever ``.env`` happens to contain.
+        """
         from app.config import Settings
 
-        settings = Settings()
+        settings = Settings(_env_file=None)
         config = SandboxConfig()
 
         assert config.memory_limit == settings.sandbox_memory_limit

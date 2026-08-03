@@ -95,7 +95,7 @@ class _SimulatedContainer:
             self._prepare_archive_params()
             self._run_shell(command)
             self._remap_archive_result()
-        elif command.startswith("python "):
+        elif command.startswith(("python ", "python -u ")):
             self._run_python(command)
         elif command.startswith("strings "):
             self._run_strings(command)
@@ -126,7 +126,8 @@ class _SimulatedContainer:
 
     def _run_python(self, command: str) -> None:
         """Execute a python command, remapping /workspace inside scripts."""
-        rest = command[len("python "):].strip()
+        prefix = "python -u " if command.startswith("python -u ") else "python "
+        rest = command[len(prefix):].strip()
         if not rest.startswith("-c"):
             script_path = rest.strip().strip('"\'')
             if self._workspace_source:

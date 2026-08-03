@@ -62,12 +62,21 @@ class ContainerExecutionError(SandboxError):
         exit_code: int,
         stderr: str,
         stdout: str = "",
+        container_id: Optional[str] = None,
+        command: str = "",
     ) -> None:
         self.exit_code = exit_code
         self.stderr = stderr
         self.stdout = stdout
+        self.container_id = container_id
+        self.command = command
         super().__init__(
-            f"Container exited with code {exit_code}: {stderr[:500]}"
+            "Container execution failed"
+            f"{' (container ' + container_id + ')' if container_id else ''}"
+            f"{' command: ' + command if command else ''}"
+            f" exited with code {exit_code}."
+            f"\nstdout:\n{stdout}"
+            f"\nstderr:\n{stderr}"
         )
 
 
@@ -634,9 +643,14 @@ class DockerSandbox:
                 "Container created",
                 container_id=container_id,
                 image=effective_image,
+                network_disabled=self.config.network_disabled,
+                command=command[:200],
             )
 
-            container.start()
+            await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: container.start(),
+            )
 
             # Wait for completion with timeout
             try:
@@ -680,6 +694,11 @@ class DockerSandbox:
                     container_id=container_id,
                     image=effective_image,
                     timed_out=True,
+                    metadata={
+                        "network_disabled": self.config.network_disabled,
+                        "command": command,
+                        "workspace_path": str(workspace_path) if workspace_path else None,
+                    },
                 )
 
             exit_code = result_data.get("StatusCode", -1)
@@ -703,6 +722,11 @@ class DockerSandbox:
                 container_id=container_id,
                 image=effective_image,
                 timed_out=False,
+                metadata={
+                    "network_disabled": self.config.network_disabled,
+                    "command": command,
+                    "workspace_path": str(workspace_path) if workspace_path else None,
+                },
             )
 
             self.logger.info(
@@ -713,6 +737,7 @@ class DockerSandbox:
                 stdout_len=len(stdout),
                 stderr_len=len(stderr),
                 success=success,
+                network_disabled=self.config.network_disabled,
             )
 
             return result
@@ -726,7 +751,11 @@ class DockerSandbox:
             self.logger.error(
                 "Unexpected sandbox error",
                 error=str(exc),
+                error_type=type(exc).__name__,
                 execution_time_ms=elapsed,
+                container_id=container_id,
+                command=command[:200],
+                exc_info=True,
             )
             raise SandboxError(
                 f"Unexpected error during sandbox execution: {exc}"

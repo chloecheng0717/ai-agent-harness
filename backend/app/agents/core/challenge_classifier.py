@@ -274,7 +274,7 @@ print(text)
 _TRAIN_CODE = """\
 import json, re
 text = open('/workspace/banner.txt').read()
-coord = re.compile(r'\\((-?\\d+)\\s*[,;]\\s*(-?\\d+)\\)')
+coord = re.compile(r'\\(([+-]?\\d+)\\s*[,;]\\s*([+-]?\\d+)\\)')
 points = []
 for line in text.splitlines():
     m = coord.search(line)

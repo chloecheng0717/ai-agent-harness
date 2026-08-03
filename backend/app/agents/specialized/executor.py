@@ -472,7 +472,7 @@ class ExecutorAgent(BaseAgent):
         last_error: Optional[str] = None
         last_was_timeout: bool = False
         timeout = self.default_timeout
-        step_timeout = step.tool_parameters.pop("_timeout", None)
+        step_timeout = step.tool_parameters.get("_timeout", None)
         if isinstance(step_timeout, (int, float)) and step_timeout > 0:
             timeout = int(step_timeout)
 
@@ -604,7 +604,11 @@ class ExecutorAgent(BaseAgent):
 
         request = ToolExecutionRequest(
             tool_name=step.tool_name,
-            parameters=step.tool_parameters,
+            parameters={
+                key: value
+                for key, value in step.tool_parameters.items()
+                if key != "_timeout"
+            },
             timeout=timeout,
             agent_permissions=[
                 ToolPermission.READ,
