@@ -98,6 +98,13 @@ _TOOL_KEYWORDS: dict[str, list[str]] = {
         "run code",
         "execute code",
         "custom logic",
+        "socket",
+        "network",
+        "netcat",
+        "tcp",
+        "connect",
+        "remote service",
+        "host:port",
     ],
 }
 

@@ -173,6 +173,16 @@ class BenchmarkOrchestrator(Orchestrator):
 
     async def create_plan(self, state: AgentState) -> AgentState:
         """Ask the LLM to author a plan whose steps carry real tool arguments."""
+        # A network challenge is solved by the deterministic socket plan so
+        # the remote service is interacted with instead of the goal text
+        # being misread as encoded data.  This also keeps offline benchmark
+        # runs (sandbox network disabled) from attempting real connections.
+        state = self._build_network_plan(state)
+        if state.plan:
+            if self.verbose:
+                self._print_plan(state)
+            return state
+
         if self.llm_provider is None or not state.tools_available:
             state = await super().create_plan(state)
             return state
@@ -205,6 +215,15 @@ class BenchmarkOrchestrator(Orchestrator):
             "- When data is encoded, decode ONE layer per step. If a decode "
             "still yields encoded-looking text (hex, base64, or URL-escaped), "
             "add a further step to decode the next layer.\n"
+            "- A challenge that points at a remote service ('Service "
+            "endpoint', 'host:port', 'nc host port', netcat, socket/TCP "
+            "connection instructions) is a NETWORK challenge: use the "
+            "'python' tool to open a socket, read the welcome banner, follow "
+            "the service's commands (e.g. SET / SHOW / CHECK), and recover "
+            "the flag from the service's reply. Do NOT treat the hostname, "
+            "banner, or protocol text as encoded data to decode, and do not "
+            "re-read the same file or re-decode the same input more than "
+            "once.\n"
             "- The task is complete only when the literal flag text (matching "
             "'flag{...}') is recovered. Keep planning until the flag is "
             "recovered."

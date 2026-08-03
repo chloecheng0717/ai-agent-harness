@@ -20,6 +20,12 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional
 import structlog
 
 from app.agents.base import AgentConfig, BaseAgent
+from app.agents.core.challenge_classifier import (
+    NETWORK,
+    build_network_plan,
+    classify_challenge,
+    extract_endpoint,
+)
 from app.agents.core.tool_selector import ToolSelector
 from app.models.agent import AgentType
 from app.models.llm import (
@@ -88,6 +94,13 @@ Tool guidance:
   hidden content.
 - Decode encoded data ONE layer per step; if a decode still yields encoded
   text (hex, base64, URL escapes), add a step for the next layer.
+- A challenge that points at a remote service ('Service endpoint',
+  'host:port', 'nc host port', netcat, socket/TCP connection instructions)
+  is a NETWORK challenge: use the 'python' tool to open a socket, read the
+  welcome banner, follow the service's commands, and recover the flag from
+  the service's reply.  Do NOT treat the hostname, banner, or protocol text
+  as encoded data to decode, and do not re-read the same file or re-decode
+  the same input more than once.
 - Keep planning until the flag text (matching 'flag{...}') is recovered.
 """
 
@@ -186,6 +199,13 @@ class PlannerAgent(BaseAgent):
         )
         if not tools_available and tool_registry is not None:
             tools_available = [t["name"] for t in tool_registry.list_tools()]
+
+        # A goal that targets a remote TCP service is solved by a
+        # deterministic socket plan, never by re-decoding the description
+        # as if it were encoded data.
+        network_result = self._network_plan_if_applicable(goal, tools_available)
+        if network_result is not None:
+            return network_result
 
         # Decide whether to generate or revise
         if previous_plan and errors:
@@ -339,6 +359,54 @@ class PlannerAgent(BaseAgent):
             self.logger.error("Unexpected planning error", error=str(exc))
 
         return self._template_fallback(goal, tools_available)
+
+    # ── Deterministic network handling ─────────────────────────
+
+    def _network_plan_if_applicable(
+        self,
+        goal: str,
+        tools_available: list[str],
+    ) -> dict[str, Any] | None:
+        """
+        Return a complete, validated network plan when *goal* targets a
+        remote TCP service, or ``None`` to fall through to normal planning.
+
+        The plan uses the ``python`` tool with real socket code so the
+        agent interacts with the service instead of decoding the goal text.
+        """
+        if "python" not in tools_available:
+            return None
+        if classify_challenge(goal) != NETWORK:
+            return None
+        endpoint = extract_endpoint(goal)
+        if endpoint is None:
+            return None
+
+        host, port = endpoint
+        steps = build_network_plan(host, port)
+        validation_errors = self.validate_plan(steps)
+        if validation_errors:
+            self.logger.warning(
+                "Network plan failed validation",
+                errors=validation_errors,
+            )
+            return None
+
+        self.logger.info(
+            "Network challenge detected; using deterministic socket plan",
+            host=host,
+            port=port,
+        )
+        self.update_memory("last_goal", goal)
+        self.update_memory("last_plan", [s.model_dump() for s in steps])
+        self.update_memory("challenge_category", NETWORK)
+        return {
+            "success": True,
+            "plan": [s.model_dump() for s in steps],
+            "errors": [],
+            "category": NETWORK,
+            "plan_source": "network_detected",
+        }
 
     async def revise_plan(
         self,

@@ -21,6 +21,12 @@ from typing import TYPE_CHECKING, Any, Callable, Coroutine, Dict, List, Optional
 
 import structlog
 
+from app.agents.core.challenge_classifier import (
+    NETWORK,
+    build_network_plan,
+    classify_challenge,
+    extract_endpoint,
+)
 from app.agents.core.tool_selector import ToolSelector
 from app.config import get_settings
 from app.models.llm import (
@@ -281,6 +287,14 @@ class Orchestrator:
             )
         if state.metadata.get("replan_feedback"):
             parts.append(f"Feedback: {state.metadata['replan_feedback']}")
+        if state.metadata.get("force_replan"):
+            parts.append(
+                "MANDATORY: the previous iterations made no progress (the "
+                "same tool calls produced the same output every time). "
+                "Produce a fundamentally different plan: do not repeat any "
+                "prior tool call, do not re-read the same file, and do not "
+                "re-decode the same input."
+            )
         if state.metadata.get("previous_plan"):
             prev_descs = [
                 p.get("description", "")
@@ -290,6 +304,129 @@ class Orchestrator:
                 "Previous plan steps: " + " -> ".join(prev_descs)
             )
         return "\n".join(parts)
+
+    # ── deterministic network handling ────────────────────────
+
+    def _network_enabled(self) -> bool:
+        """
+        Whether the sandbox allows outbound TCP connections.
+
+        When no sandbox is attached (unit tests, per-call workspaces) the
+        network is treated as available so the deterministic plan can be
+        built and tested.  A sandbox with networking disabled blocks the
+        override so offline runs never attempt a real connection.
+        """
+        if self.sandbox is None:
+            return True
+        try:
+            return not bool(self.sandbox.config.network_disabled)
+        except Exception:
+            return True
+
+    def _build_network_plan(self, state: AgentState) -> AgentState:
+        """
+        Populate a deterministic socket plan when the goal targets a remote
+        TCP service, overriding LLM/template planning.
+
+        The classification text combines the (possibly LLM-summarised) goal
+        with the raw user description so a ``host:port`` endpoint is found
+        even when the summariser dropped it.
+        """
+        if state.plan:
+            return state
+        if "python" not in state.tools_available:
+            return state
+        if not self._network_enabled():
+            return state
+
+        user_text = ""
+        for message in reversed(state.messages):
+            if message.role == "user":
+                user_text = message.content
+                break
+        text = f"{state.goal}\n{user_text}".strip()
+
+        if classify_challenge(text) != NETWORK:
+            return state
+        endpoint = extract_endpoint(text)
+        if endpoint is None:
+            return state
+
+        host, port = endpoint
+        state.plan = build_network_plan(host, port)
+        state.metadata["plan_source"] = "network_detected"
+        state.metadata["challenge_category"] = NETWORK
+        state.metadata["network_endpoint"] = f"{host}:{port}"
+        self.logger.info(
+            "Network challenge detected; using deterministic socket plan",
+            host=host,
+            port=port,
+        )
+        return state
+
+    # ── progress guard ────────────────────────────────────────
+
+    def _iteration_tool_signatures(
+        self,
+        state: AgentState,
+    ) -> list[tuple[str, str]]:
+        """
+        Fingerprint the tool invocations of the current plan as sorted
+        ``(tool_name, canonical parameters)`` pairs.
+        """
+        signatures: set[tuple[str, str]] = set()
+        for plan_step in state.plan:
+            if not plan_step.tool_name:
+                continue
+            signatures.add(
+                (
+                    plan_step.tool_name,
+                    json.dumps(plan_step.tool_parameters or {}, sort_keys=True),
+                )
+            )
+        return sorted(signatures)
+
+    def _update_progress_tracking(self, state: AgentState, iteration: int) -> None:
+        """
+        Detect plan-execute loops that make no progress — the same tool
+        calls producing the same output every iteration — and flag them so
+        the next plan is forced to change strategy.
+        """
+        history = state.metadata.setdefault("execution_history", [])
+        signatures = self._iteration_tool_signatures(state)
+        evidence = self._results_evidence_text(state)
+        entry: dict[str, Any] = {
+            "iteration": iteration,
+            "tool_signatures": signatures,
+            "evidence": evidence,
+            "flag_found": bool(_FLAG_PATTERN_RE.search(evidence)),
+        }
+
+        streak = 0
+        if history:
+            previous = history[-1]
+            same_tools = previous.get("tool_signatures") == entry["tool_signatures"]
+            same_evidence = previous.get("evidence") == evidence
+            if same_tools and same_evidence:
+                streak = state.metadata.get("no_progress_streak", 0) + 1
+        state.metadata["no_progress_streak"] = streak
+        history.append(entry)
+
+        if streak >= 2:
+            state.metadata["force_replan"] = True
+            state.metadata["replan_feedback"] = (
+                "No progress has been made: the same tool calls have "
+                "produced the same output every iteration. Do NOT repeat any "
+                "of them. Keep already-fetched data in the workspace and "
+                "change strategy completely (interact with the remote "
+                "service, try a different encoding, or inspect a different "
+                "file)."
+            )
+            self.logger.warning(
+                "No progress across iterations — forcing replan",
+                streak=streak,
+                iteration=iteration,
+            )
 
     # ── public entry point ───────────────────────────────────
 
@@ -393,6 +530,8 @@ class Orchestrator:
                         iteration=iteration,
                     )
                     break
+
+                self._update_progress_tracking(state, iteration)
 
                 self.logger.info(
                     "Task not yet complete — re-planning",
@@ -676,6 +815,13 @@ class Orchestrator:
         if state.plan:
             return state
 
+        # A goal that targets a remote TCP service gets a deterministic
+        # socket plan instead of LLM planning, so the service is interacted
+        # with rather than re-decoded as if it were encoded data.
+        state = self._build_network_plan(state)
+        if state.plan:
+            return state
+
         # ── PlannerAgent path ─────────────────────────────────
         tools_desc = self._format_tool_descriptions(state.tools_available)
         if self.planner is not None:
@@ -739,6 +885,13 @@ class Orchestrator:
                     "- When data is encoded, decode ONE layer per step. If a "
                     "decode still yields encoded-looking text (hex, base64, or "
                     "URL-escaped), add a further step to decode the next layer.\n"
+                    "- A challenge that points at a remote service ('Service "
+                    "endpoint', 'host:port', 'nc host port', netcat, socket/TCP "
+                    "instructions) is a NETWORK challenge: use the 'python' "
+                    "tool to open a socket, read the banner, and follow the "
+                    "service's commands to recover the flag. Do NOT treat the "
+                    "hostname or banner as encoded data to decode, and do not "
+                    "re-read the same file or re-decode the same input.\n"
                     "- Keep planning until the flag text (matching 'flag{...}') "
                     "is recovered."
                 ),
