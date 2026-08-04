@@ -244,6 +244,44 @@ class TestStringsTool:
         assert result.output["count"] == 5000
 
     @pytest.mark.asyncio
+    async def test_flag_beyond_truncation_still_reported(self) -> None:
+        """A flag beyond the 5000-string display limit must not be missed."""
+        lines = [f"line{i:06d}" for i in range(6000)]
+        lines[5999] = "flag{beyond_truncation}"
+        big_output = "\n".join(lines) + "\n"
+        sandbox = _mock_sandbox(_ok_result(stdout=big_output))
+        tool = StringsTool(sandbox)
+        result = await tool.execute({"path": "/big"})
+
+        assert result.success is True
+        assert result.output["truncated"] is True
+        assert result.output["count"] == 5000
+        # The flag is beyond the truncation point of the display list…
+        assert "flag{beyond_truncation}" not in result.output["strings"]
+        # …but it is still surfaced from the complete scan.
+        assert result.output["flags"] == ["flag{beyond_truncation}"]
+
+    @pytest.mark.asyncio
+    async def test_no_flags_when_output_clean(self) -> None:
+        output_text = "hello\nworld\nfoo\n"
+        sandbox = _mock_sandbox(_ok_result(stdout=output_text))
+        tool = StringsTool(sandbox)
+        result = await tool.execute({"path": "/binary"})
+
+        assert result.success is True
+        assert result.output["flags"] == []
+
+    @pytest.mark.asyncio
+    async def test_flags_detected_in_untruncated_output(self) -> None:
+        output_text = "alpha\nCTF{embedded_flag}\nomega\n"
+        sandbox = _mock_sandbox(_ok_result(stdout=output_text))
+        tool = StringsTool(sandbox)
+        result = await tool.execute({"path": "/binary"})
+
+        assert result.success is True
+        assert result.output["flags"] == ["CTF{embedded_flag}"]
+
+    @pytest.mark.asyncio
     async def test_empty_output(self) -> None:
         sandbox = _mock_sandbox(_ok_result(stdout=""))
         tool = StringsTool(sandbox)
@@ -517,6 +555,41 @@ class TestEncodingTool:
         assert result.output["mode_used"] == "decode"
 
     @pytest.mark.asyncio
+    async def test_auto_detect_paddingless_base64(self) -> None:
+        """Paddingless base64 (no '=' and no '+'/'/') must auto-decode."""
+        sandbox = _mock_sandbox(
+            _ok_result(stdout="flag{test123}\n")
+        )
+        tool = EncodingTool(sandbox)
+        result = await tool.execute({
+            "input": "ZmxhZ3t0ZXN0MTIzfQ",
+            "encoding": "base64",
+            "mode": "auto",
+        })
+        assert result.success is True
+        assert result.output["mode_used"] == "decode"
+
+    @pytest.mark.asyncio
+    async def test_auto_detect_paddingless_base64_of_flag(self) -> None:
+        """Unpadded base64 of a long flag has no + or / and must still decode."""
+        import base64 as _b64
+
+        plain = "flag{layers_of_encoding}"
+        padded = _b64.b64encode(plain.encode()).decode()
+        unpadded = padded.rstrip("=")
+        assert "+" not in unpadded and "/" not in unpadded and "=" not in unpadded
+
+        sandbox = _mock_sandbox(_ok_result(stdout=plain + "\n"))
+        tool = EncodingTool(sandbox)
+        result = await tool.execute({
+            "input": unpadded,
+            "encoding": "base64",
+            "mode": "auto",
+        })
+        assert result.success is True
+        assert result.output["mode_used"] == "decode"
+
+    @pytest.mark.asyncio
     async def test_auto_detect_encode_plaintext(self) -> None:
         sandbox = _mock_sandbox(
             _ok_result(stdout="68656c6c6f")
@@ -591,6 +664,21 @@ class TestEncodingTool:
         # Base64 with +/ → decode
         assert EncodingTool._detect_mode("a+b/c", "base64") == "decode"
         assert EncodingTool._detect_mode("hello", "base64") == "encode"
+        # Paddingless base64 (no + or /) → decode when it round-trips
+        assert EncodingTool._detect_mode("ZmxhZ3t0ZXN0MTIzfQ", "base64") == "decode"
+        assert (
+            EncodingTool._detect_mode(
+                "ZmxhZ3tsYXllcnNfb2ZfZW5jb2Rpbmd9", "base64"
+            )
+            == "decode"
+        )
+        # Plain lowercase words and short tokens are NOT paddingless base64
+        assert EncodingTool._detect_mode("helloworld", "base64") == "encode"
+        assert EncodingTool._detect_mode("description", "base64") == "encode"
+        # A plain mixed-case word that happens to be valid b64 alphabet but
+        # has no digits must NOT be treated as encoded.
+        assert EncodingTool._detect_mode("HelloWorldSomething", "base64") == "encode"
+        assert EncodingTool._detect_mode("Supercalifragilistic", "base64") == "encode"
         # Hex
         assert EncodingTool._detect_mode("48656c6c6f", "hex") == "decode"
         assert EncodingTool._detect_mode("hello", "hex") == "encode"

@@ -5,6 +5,7 @@ Encode / decode between base64, hex, and URL encodings.
 Runs the actual work inside a Docker sandbox for safety.
 """
 
+import base64
 import re
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
@@ -28,8 +29,7 @@ if TYPE_CHECKING:
 _VALID_ENCODINGS = {"base64", "hex", "url"}
 
 # Regex patterns for auto-detecting encoding direction
-# Require base64 padding for auto-detection to avoid false positives on
-# short ASCII strings like "hello" that happen to use valid b64 chars.
+# Padded base64 (its ``=`` suffix) is the least ambiguous signal.
 _B64_RE = re.compile(
     r"^[A-Za-z0-9+/]{2,}={1,2}$", re.MULTILINE
 )
@@ -38,6 +38,11 @@ _HEX_RE = re.compile(
 )
 _URL_RE = re.compile(
     r"%[0-9a-fA-F]{2}", re.MULTILINE
+)
+
+#: Standard base64 alphabet (no ``=`` padding).
+_BASE64_CHARS = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
 )
 
 
@@ -108,6 +113,32 @@ class EncodingTool(BaseTool):
     # -- auto-detection helpers ------------------------------------
 
     @staticmethod
+    def _looks_like_paddingless_base64(data: str) -> bool:
+        """Detect unpadded base64 that decodes to *meaningful* bytes.
+
+        Conservative: must round-trip exactly after re-encoding and must
+        contain at least one digit.  Plain mixed-case words such as
+        "HelloWorldSomething" happen to be valid base64 alphabet, so the
+        digit requirement keeps them out while real flag payloads (which
+        almost always contain digits in their encoding) are caught.
+        """
+        token = data.strip()
+        if len(token) < 8 or len(token) % 4 == 1:
+            return False
+        if "=" in token or not all(c in _BASE64_CHARS for c in token):
+            return False
+        if not any(c.isalpha() for c in token):
+            return False
+        if not any(c.isdigit() for c in token):
+            return False
+        padded = token + "=" * ((4 - len(token) % 4) % 4)
+        try:
+            decoded = base64.b64decode(padded, validate=True)
+        except Exception:
+            return False
+        return base64.b64encode(decoded).decode().rstrip("=") == token
+
+    @staticmethod
     def _detect_mode(data: str, encoding: str) -> str:
         """Heuristic to decide whether data looks encoded or plain."""
         stripped = data.strip()
@@ -120,6 +151,9 @@ class EncodingTool(BaseTool):
                 return "decode"
             # Contains base64-specific chars (+ or /) → likely encoded
             if "+" in stripped or "/" in stripped:
+                return "decode"
+            # Unpadded base64 → likely encoded
+            if EncodingTool._looks_like_paddingless_base64(stripped):
                 return "decode"
             return "encode"
 

@@ -468,6 +468,42 @@ class TestDeterministicCompletionGuard:
         assert state.metadata["task_complete"] is False
         assert state.metadata.get("replan_feedback")
 
+    def test_guard_blocks_completion_when_output_is_paddingless_base64(self) -> None:
+        """Regression: unpadded base64 (no '=', '+', or '/') is still encoded.
+
+        A first decode that yields another paddingless base64 layer must not
+        let the lazy evaluator's COMPLETE: YES finish the run early.
+        """
+        orch = Orchestrator()
+        state = AgentState()
+        # base64('flag{one_more_layer}') with the '=' padding stripped.
+        state.results = [
+            {"step_index": 0, "output": {"stdout": "ZmxhZ3tvbmVfbW9yZV9sYXllcn0"}}
+        ]
+        state.metadata["task_complete"] = True
+
+        orch._enforce_deterministic_completion(state)
+
+        assert state.metadata["task_complete"] is False
+        assert "encoded" in state.metadata.get("replan_feedback", "")
+
+    def test_guard_allows_completion_for_mixed_case_word(self) -> None:
+        """Regression: a plain word that is coincidentally base64 alphabet.
+
+        'HelloWorldSomething' has no digits and must not be mistaken for a
+        paddingless base64 layer, otherwise the run loops forever.
+        """
+        orch = Orchestrator()
+        state = AgentState()
+        state.results = [
+            {"step_index": 0, "output": {"stdout": "HelloWorldSomething"}}
+        ]
+        state.metadata["task_complete"] = True
+
+        orch._enforce_deterministic_completion(state)
+
+        assert state.metadata["task_complete"] is True
+
     def test_guard_allows_completion_when_flag_recovered(self) -> None:
         orch = Orchestrator()
         state = AgentState()

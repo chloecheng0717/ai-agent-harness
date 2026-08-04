@@ -14,6 +14,7 @@ with structured logging, exception handling, and retry support.
 """
 
 import asyncio
+import base64
 import json
 import re
 import time
@@ -100,6 +101,32 @@ _BASE64_CHARS = frozenset(
 )
 
 
+def _looks_like_paddingless_base64(token: str) -> bool:
+    """Detect unpadded base64 that decodes to meaningful bytes.
+
+    Conservative: requires exact round-trip after re-encoding plus at
+    least one digit.  Plain mixed-case words such as "HelloWorldSomething"
+    are valid base64 alphabet, so the digit requirement keeps them out
+    while real flag payloads (which almost always contain digits in their
+    encoding) are caught.
+    """
+    token = token.strip()
+    if len(token) < 8 or len(token) % 4 == 1:
+        return False
+    if "=" in token or not all(c in _BASE64_CHARS for c in token):
+        return False
+    if not any(c.isalpha() for c in token):
+        return False
+    if not any(c.isdigit() for c in token):
+        return False
+    padded = token + "=" * ((4 - len(token) % 4) % 4)
+    try:
+        decoded = base64.b64decode(padded, validate=True)
+    except Exception:
+        return False
+    return base64.b64encode(decoded).decode().rstrip("=") == token
+
+
 def _looks_like_encoded_token(token: str) -> bool:
     """Whether a single whitespace-free token is predominantly encoded data."""
     if not token:
@@ -110,6 +137,8 @@ def _looks_like_encoded_token(token: str) -> bool:
         return True
     if _URL_ESCAPE_RE.search(token):
         return len(_URL_ESCAPE_RE.findall(token)) >= 3
+    if _looks_like_paddingless_base64(token):
+        return True
     return False
 
 
@@ -1236,7 +1265,18 @@ class Orchestrator:
                     return value
             strings = output.get("strings")
             if isinstance(strings, list):
-                return "\n".join(str(s) for s in strings if s)
+                text = "\n".join(str(s) for s in strings if s)
+                # Surface flags found anywhere in the complete tool output
+                # (e.g. a strings scan that truncated the display list).
+                flags = output.get("flags")
+                if isinstance(flags, list):
+                    for flag in flags:
+                        if flag not in text:
+                            text += f"\n{flag}"
+                return text
+            flags = output.get("flags")
+            if isinstance(flags, list):
+                return "\n".join(str(f) for f in flags if f)
         return ""
 
     def _results_evidence_text(self, state: AgentState) -> str:
@@ -1442,7 +1482,11 @@ class Orchestrator:
                     text = "\n".join(items)
                     if len(text) > 500:
                         text = text[:500] + "..."
-                    return f"{step_label} ({len(items)} strings):\n{text}"
+                    result_text = f"{step_label} ({len(items)} strings):\n{text}"
+                    flags = output.get("flags")
+                    if isinstance(flags, list) and flags:
+                        result_text += f"\nFLAGS FOUND: {', '.join(flags)}"
+                    return result_text
                 return f"{step_label}: (no strings found)"
             if "mime_type" in output:
                 return f"{step_label}: {output['mime_type']} ({output.get('description', '')})"

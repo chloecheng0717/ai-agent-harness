@@ -5,6 +5,7 @@ Extracts printable strings from a target file or buffer using the
 ``strings`` command inside a Docker sandbox.
 """
 
+import re
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import structlog
@@ -25,6 +26,9 @@ if TYPE_CHECKING:
 
 # Maximum number of strings to return before truncation kicks in.
 MAX_STRINGS: int = 5000
+
+#: Flag-like tokens worth surfacing even when the string list is truncated.
+_FLAG_PATTERN_RE = re.compile(r"(?:flag|ctf|academy)\{[^\}]+\}", re.IGNORECASE)
 
 
 class StringsTool(BaseTool):
@@ -84,6 +88,14 @@ class StringsTool(BaseTool):
                     },
                     "count": {"type": "integer"},
                     "truncated": {"type": "boolean"},
+                    "flags": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "Flag-like lines found anywhere in the complete "
+                            "output, even beyond the truncation limit"
+                        ),
+                    },
                 },
             },
             tags=["ctf", "strings", "extract", "binary"],
@@ -142,6 +154,15 @@ class StringsTool(BaseTool):
         # Parse stdout into individual strings
         raw_lines = result.stdout.splitlines()
         extracted: List[str] = raw_lines if result.success else []
+
+        # Scan the COMPLETE output for flags before any truncation so a
+        # flag buried beyond the display limit is never missed.
+        flags: List[str] = []
+        if result.success:
+            for line in raw_lines:
+                if _FLAG_PATTERN_RE.search(line):
+                    flags.append(line.strip())
+
         truncated = len(extracted) > MAX_STRINGS
         if truncated:
             extracted = extracted[:MAX_STRINGS]
@@ -153,6 +174,7 @@ class StringsTool(BaseTool):
                 "count": len(extracted),
                 "truncated": truncated,
                 "total_before_truncation": len(raw_lines) if truncated else len(extracted),
+                "flags": flags,
             },
             error=result.stderr if not result.success else None,
             execution_time=result.execution_time,

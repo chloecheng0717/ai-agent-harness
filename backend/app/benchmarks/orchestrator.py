@@ -149,6 +149,29 @@ class BenchmarkOrchestrator(Orchestrator):
 
     # ── planning with LLM-authored tool parameters ──────────────
 
+    def _plan_context(self, state: AgentState) -> str:
+        """Append the challenge file inventory to the base planning context.
+
+        Both the :class:`PlannerAgent` path and the direct LLM path call
+        this method, so every planner is told exactly which files exist and
+        the workspace-absolute path of each one.  Without this the LLM
+        invents placeholder paths (``/data/payload.bin``) or leaves
+        ``tool_parameters`` empty and the repair logic has to guess.
+        """
+        base = super()._plan_context(state)
+        parts = [base] if base else []
+        if self.challenge_files:
+            names = sorted(
+                rel.lstrip("/\\").replace("\\", "/")
+                for rel in self.challenge_files
+            )
+            if names:
+                parts.append(
+                    "Workspace files available to the agent:\n"
+                    + "\n".join(f"  - /workspace/{name}" for name in names)
+                )
+        return "\n".join(parts)
+
     def _format_tool_descriptions(self, tool_names: list[str]) -> str:
         """Describe tools including their parameter schemas."""
         parts: list[str] = []
@@ -202,6 +225,11 @@ class BenchmarkOrchestrator(Orchestrator):
             "useful); for 'file' or 'strings' provide 'path' or 'content'. "
             "Never guess or pad placeholders. Use {} when the step needs no "
             "tool. Reply with RAW JSON only -- no markdown, no code fences.\n\n"
+            "The user message lists every file available in the workspace "
+            "with its exact '/workspace/<name>' path. For 'strings', 'file', "
+            "and 'archive' steps always use one of those exact paths as "
+            "'path'/'archive_path' -- never invent a path that is not in the "
+            "file listing.\n\n"
             "Tool guidance:\n"
             "- Use 'strings' to extract hidden/embedded/printable text from "
             "files, logs, and binaries. Prefer it whenever the goal is to "
@@ -291,8 +319,9 @@ class BenchmarkOrchestrator(Orchestrator):
         a ``path`` argument, which makes execution fail with "Either
         'path' or 'content' must be provided".  When the challenge ships
         seed files and a step's parameters are missing the path-type input
-        (and no ``content`` alternative is given), the first seed file is
-        used so the step can actually run.
+        (and no ``content`` alternative is given), the seed file that best
+        matches the goal and step description is used so the step can
+        actually run.
         """
         if not self.challenge_files:
             return
@@ -314,7 +343,12 @@ class BenchmarkOrchestrator(Orchestrator):
                 and params.get("content") is not None
             ):
                 continue
-            params[path_param] = "/workspace/" + seed_names[0]
+            seed = self._select_seed_file(
+                seed_names,
+                state.goal or "",
+                step.description or "",
+            )
+            params[path_param] = "/workspace/" + seed
             step.tool_parameters = params
             self.logger.info(
                 "Filled missing tool path parameter",
@@ -323,6 +357,37 @@ class BenchmarkOrchestrator(Orchestrator):
                 param=path_param,
                 value=params[path_param],
             )
+
+    @staticmethod
+    def _select_seed_file(
+        seed_names: list[str],
+        goal: str,
+        step_description: str,
+    ) -> str:
+        """
+        Pick the seed file the goal/step most likely refers to.
+
+        The first seed file used to be the unconditional default, which
+        pointed ``strings``/``file``/``archive`` at the wrong file whenever
+        a challenge shipped more than one payload.  The file whose name
+        (or workspace path) appears most often in the goal and step
+        description is chosen; an explicit full-path mention outranks a
+        bare basename mention.
+        """
+        haystack = f"{goal}\n{step_description}".lower()
+        best = seed_names[0]
+        best_score = 0
+        for name in seed_names:
+            score = 0
+            if f"/workspace/{name.lower()}" in haystack:
+                score += 5
+            base = name.rsplit("/", 1)[-1].lower()
+            if base:
+                score += haystack.count(base)
+            if score > best_score:
+                best_score = score
+                best = name
+        return best
 
     def _print_plan(self, state: AgentState) -> None:
         print("\n===== PLAN =====")
