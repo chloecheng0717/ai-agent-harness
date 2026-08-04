@@ -31,6 +31,7 @@ from app.agents.core.challenge_classifier import (
     classify_challenge,
     extract_endpoint,
     is_network_text,
+    is_perceptron_network,
 )
 from app.agents.core.orchestrator import Orchestrator
 from app.agents.specialized.planner import PlannerAgent
@@ -195,11 +196,14 @@ class TestBuildNetworkPlan:
 
 class TestPlannerNetworkRouting:
     @pytest.mark.asyncio
-    async def test_network_goal_returns_deterministic_plan(self) -> None:
+    async def test_perceptron_goal_returns_deterministic_plan(self) -> None:
         agent = PlannerAgent()
         result = await agent.process(
             {
-                "goal": "$ nc svc.cylabacademy.net 63576 and solve the challenge",
+                "goal": (
+                    "$ nc svc.cylabacademy.net 63576 and train a perceptron "
+                    "so every training point is classified correctly"
+                ),
                 "tools_available": ["python"],
             }
         )
@@ -210,11 +214,26 @@ class TestPlannerNetworkRouting:
         assert all(step["tool_name"] == "python" for step in result["plan"])
 
     @pytest.mark.asyncio
+    async def test_generic_network_goal_uses_normal_planning(self) -> None:
+        """A non-perceptron network goal must NOT get the perceptron plan."""
+        agent = PlannerAgent()
+        result = await agent.process(
+            {
+                "goal": "$ nc svc.cylabacademy.net 63576 and solve the challenge",
+                "tools_available": ["python"],
+            }
+        )
+        assert result.get("plan_source") != "network_detected"
+
+    @pytest.mark.asyncio
     async def test_network_goal_without_python_falls_back(self) -> None:
         agent = PlannerAgent()
         result = await agent.process(
             {
-                "goal": "$ nc svc.cylabacademy.net 63576",
+                "goal": (
+                    "$ nc svc.cylabacademy.net 63576 and train a perceptron "
+                    "on the points"
+                ),
                 "tools_available": ["file", "strings"],
             }
         )
@@ -246,10 +265,11 @@ class TestOrchestratorNetworkOverride:
         return state
 
     @pytest.mark.asyncio
-    async def test_network_plan_built_from_goal(self) -> None:
+    async def test_perceptron_plan_built_from_goal(self) -> None:
         orch = Orchestrator()  # no sandbox -> network enabled
         state = self._state_with_user_text(
-            "$ nc svc.cylabacademy.net 4444 and grab the flag"
+            "$ nc svc.cylabacademy.net 4444 and train a perceptron "
+            "to classify every point"
         )
         state = await orch.create_plan(state)
         assert state.metadata.get("plan_source") == "network_detected"
@@ -257,9 +277,38 @@ class TestOrchestratorNetworkOverride:
         assert len(state.plan) == 3
 
     @pytest.mark.asyncio
+    async def test_generic_network_goal_uses_normal_planning(self) -> None:
+        """A banner-grab network goal must not get the perceptron plan."""
+        orch = Orchestrator()
+        state = self._state_with_user_text(
+            "$ nc svc.cylabacademy.net 4444 and grab the flag"
+        )
+        state = await orch.create_plan(state)
+        assert state.metadata.get("plan_source") != "network_detected"
+
+    @pytest.mark.asyncio
     async def test_non_network_goal_untouched(self) -> None:
         orch = Orchestrator()
         state = self._state_with_user_text("decode base64 aGVsbG8=")
+        state = await orch.create_plan(state)
+        assert state.metadata.get("plan_source") != "network_detected"
+
+    @pytest.mark.asyncio
+    async def test_failed_network_plan_not_rebuilt_next_iteration(self) -> None:
+        """After a deterministic network plan runs and fails, the next
+        iteration falls back to LLM planning instead of repeating it."""
+        orch = Orchestrator()
+        state = self._state_with_user_text(
+            "$ nc svc.cylabacademy.net 4444 and train a perceptron "
+            "to classify every point"
+        )
+        state = await orch.create_plan(state)
+        assert state.metadata.get("plan_source") == "network_detected"
+
+        # Simulate the failed iteration: plan cleared, errors recorded, and
+        # the loop re-enters create_plan.
+        state.plan.clear()
+        state.add_error("SET failed: unknown command")
         state = await orch.create_plan(state)
         assert state.metadata.get("plan_source") != "network_detected"
 
@@ -276,7 +325,8 @@ class TestOrchestratorNetworkOverride:
         orch = Orchestrator()
         orch.sandbox = cast(DockerSandbox, FakeSandbox())
         state = self._state_with_user_text(
-            "$ nc svc.cylabacademy.net 4444 and grab the flag"
+            "$ nc svc.cylabacademy.net 4444 and train a perceptron "
+            "to classify every point"
         )
         state = await orch.create_plan(state)
         assert state.metadata.get("plan_source") != "network_detected"
@@ -294,10 +344,39 @@ class TestOrchestratorNetworkOverride:
         orch = Orchestrator()
         orch.sandbox = cast(DockerSandbox, FakeSandbox())
         state = self._state_with_user_text(
-            "$ nc svc.cylabacademy.net 4444 and grab the flag"
+            "$ nc svc.cylabacademy.net 4444 and train a perceptron "
+            "to classify every point"
         )
         state = await orch.create_plan(state)
         assert state.metadata.get("plan_source") == "network_detected"
+
+
+# ── is_perceptron_network ─────────────────────────────────────────
+
+
+class TestIsPerceptronNetwork:
+    def test_literal_perceptron_word(self) -> None:
+        assert is_perceptron_network(
+            "$ nc host.example 1234 and train a perceptron"
+        ) is True
+
+    def test_training_points_with_weights(self) -> None:
+        assert is_perceptron_network(
+            "read the labeled training points and set the weights"
+        ) is True
+
+    def test_w1_and_w2_signals(self) -> None:
+        assert is_perceptron_network(
+            "choose weights w1 w2 and bias b for every point"
+        ) is True
+
+    def test_generic_banner_grab_is_not_perceptron(self) -> None:
+        assert is_perceptron_network(
+            "$ nc host.example 1234 and grab the banner"
+        ) is False
+
+    def test_empty_text_is_not_perceptron(self) -> None:
+        assert is_perceptron_network("") is False
 
 
 # ── Executing the network plan against a scripted service ─────────

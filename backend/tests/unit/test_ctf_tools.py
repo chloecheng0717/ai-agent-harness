@@ -17,7 +17,7 @@ import pytest
 from app.sandbox.docker_sandbox import SandboxExecutionResult
 from app.tools.plugins.file_tool import FileTool
 from app.tools.plugins.strings_tool import StringsTool
-from app.tools.plugins.python_tool import PythonTool
+from app.tools.plugins.python_tool import PythonTool, _MAX_TIMEOUT
 from app.tools.plugins.encoding_tool import EncodingTool
 from app.tools.registry import ToolRegistry
 from app.models.tool import (
@@ -291,6 +291,12 @@ class TestPythonTool:
         assert "ctf" in tool.definition.tags
         assert tool.risk_level == RiskLevel.HIGH
         assert tool.sandbox_capability == SandboxCapability.CONTAINER
+
+    def test_definition_advertises_max_timeout(self) -> None:
+        """The registry must not cap python calls below the tool's own max."""
+        sandbox = _mock_sandbox()
+        tool = PythonTool(sandbox)
+        assert tool.definition.timeout == _MAX_TIMEOUT
 
     @pytest.mark.asyncio
     async def test_execute_code(self) -> None:

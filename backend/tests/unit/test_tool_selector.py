@@ -5,7 +5,10 @@ Covers the string-extraction intent rules added for the hidden-text
 benchmarks:
 
 - ``strings`` is preferred for steps that extract hidden/embedded text
-  from files, logs, or binaries -- even when the plan named ``file``.
+  from files, logs, or binaries, but only when the LLM plan left the step
+  without an explicit tool.
+- An explicit ``tool_name`` on a plan step is always honoured and is
+  never overridden by keyword-based intent.
 - ``file`` stays the choice for metadata/type inspection.
 - Ordinary steps (decoding, archiving, computation) are never misrouted.
 """
@@ -25,22 +28,42 @@ class TestStringExtractionSelection:
         )
         assert ToolSelector().select_for_step(step, _AVAILABLE) == "strings"
 
-    def test_selects_strings_when_llm_named_file_tool(self) -> None:
-        """Hidden-string extraction overrides a plan that named 'file'."""
+    def test_explicit_file_tool_is_kept_for_string_extraction(self) -> None:
+        """An explicit 'file' tool survives a hidden-string-extraction step."""
         step = PlanStep(
             index=0,
             description="Find the flag hidden among the log lines",
             tool_name="file",
             rationale="Scan the log for embedded strings.",
         )
-        assert ToolSelector().select_for_step(step, _AVAILABLE) == "strings"
+        assert ToolSelector().select_for_step(step, _AVAILABLE) == "file"
 
-    def test_selects_strings_when_llm_named_python_tool(self) -> None:
+    def test_explicit_python_tool_is_kept_for_string_extraction(self) -> None:
         step = PlanStep(
             index=0,
             description="Locate the hidden secret inside the file",
             tool_name="python",
             rationale="Search the file for embedded printable strings.",
+        )
+        assert ToolSelector().select_for_step(step, _AVAILABLE) == "python"
+
+    def test_explicit_python_tool_kept_with_parameters(self) -> None:
+        """Regression: intent must never discard an explicit tool + params."""
+        step = PlanStep(
+            index=0,
+            description="Recover the flag hidden inside the binary file",
+            tool_name="python",
+            tool_parameters={"code": "print(open('f','rb').read())"},
+            rationale="Extract hidden printable strings from the binary.",
+        )
+        assert ToolSelector().select_for_step(step, _AVAILABLE) == "python"
+
+    def test_strings_still_chosen_when_no_explicit_tool(self) -> None:
+        """Without an explicit tool, string-extraction intent wins."""
+        step = PlanStep(
+            index=0,
+            description="Find the flag hidden among the log lines",
+            rationale="Scan the log for embedded strings.",
         )
         assert ToolSelector().select_for_step(step, _AVAILABLE) == "strings"
 

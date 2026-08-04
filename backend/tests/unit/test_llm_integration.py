@@ -362,7 +362,7 @@ class TestFullLifecycleWithLLM:
         responses = [
             _make_llm_response("Scan the target"),        # understand_task
             _make_llm_response(plan_json),                 # create_plan
-            _make_llm_response("Execution successful"),    # evaluate_result
+            _make_llm_response("COMPLETE: YES - scan complete"),  # evaluate_result
             _make_llm_response("All steps completed well"),# reflect
             _make_llm_response("Scan complete, 3 ports open"),  # respond
         ]

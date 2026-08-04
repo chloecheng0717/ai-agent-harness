@@ -26,6 +26,7 @@ from app.agents.core.challenge_classifier import (
     build_network_plan,
     classify_challenge,
     extract_endpoint,
+    is_perceptron_network,
 )
 from app.agents.core.tool_selector import ToolSelector
 from app.config import get_settings
@@ -332,8 +333,15 @@ class Orchestrator:
 
     def _build_network_plan(self, state: AgentState) -> AgentState:
         """
-        Populate a deterministic socket plan when the goal targets a remote
-        TCP service, overriding LLM/template planning.
+        Populate a deterministic socket plan when the goal targets the
+        remote perceptron-training service, overriding LLM/template
+        planning.
+
+        The plan is perceptron-specific, so it is gated on perceptron
+        wording and is built at most once per run: a network goal that is
+        not a perceptron challenge -- or a perceptron plan that already ran
+        and failed -- falls through to normal LLM planning instead of
+        repeating the same steps every iteration.
 
         The classification text combines the (possibly LLM-summarised) goal
         with the raw user description so a ``host:port`` endpoint is found
@@ -345,6 +353,11 @@ class Orchestrator:
             return state
         if not self._network_enabled():
             return state
+        # A deterministic network plan already ran this run (and the loop
+        # continued, so it did not complete).  Do not rebuild it: fall back
+        # to LLM planning instead of retrying identical failing steps.
+        if state.metadata.get("plan_source") == "network_detected":
+            return state
 
         user_text = ""
         for message in reversed(state.messages):
@@ -354,6 +367,8 @@ class Orchestrator:
         text = f"{state.goal}\n{user_text}".strip()
 
         if classify_challenge(text) != NETWORK:
+            return state
+        if not is_perceptron_network(text):
             return state
         endpoint = extract_endpoint(text)
         if endpoint is None:
@@ -822,9 +837,10 @@ class Orchestrator:
         if state.plan:
             return state
 
-        # A goal that targets a remote TCP service gets a deterministic
-        # socket plan instead of LLM planning, so the service is interacted
-        # with rather than re-decoded as if it were encoded data.
+        # A goal that targets the remote perceptron-training service gets a
+        # deterministic socket plan instead of LLM planning, so the service
+        # is interacted with rather than re-decoded as if it were encoded
+        # data.  Other network challenges use ordinary planning.
         state = self._build_network_plan(state)
         if state.plan:
             return state
@@ -1038,10 +1054,25 @@ class Orchestrator:
                             reused_from=prior.get("step_index"),
                         )
                     else:
+                        # A step-level timeout (``_timeout``, the same
+                        # convention the executor uses) overrides the tool's
+                        # defined timeout on the request; otherwise the
+                        # registry honours the tool definition's timeout.
+                        step_params = plan_step.tool_parameters or {}
+                        step_timeout = step_params.get("_timeout")
+                        request_timeout: int | None = None
+                        if isinstance(step_timeout, (int, float)) and step_timeout > 0:
+                            request_timeout = int(step_timeout)
+
                         # Create execution request with default permissions
                         request = ToolExecutionRequest(
                             tool_name=plan_step.tool_name,
-                            parameters=plan_step.tool_parameters,
+                            parameters={
+                                key: value
+                                for key, value in step_params.items()
+                                if key != "_timeout"
+                            },
+                            timeout=request_timeout,
                             agent_permissions=[
                                 ToolPermission.READ,
                                 ToolPermission.WRITE,
@@ -1155,14 +1186,19 @@ class Orchestrator:
         return state
 
     def _set_task_complete_from_eval(self, state: AgentState, evaluation: str) -> None:
-        """Parse the LLM evaluation response for the completion verdict."""
+        """
+        Parse the LLM evaluation response for the completion verdict.
+
+        Completion is only ever granted on an explicit ``COMPLETE: YES``
+        prefix.  Anything else -- an explicit ``COMPLETE: NO``, a verdict
+        that omits the prefix, or prose -- keeps the task incomplete so the
+        loop continues rather than stopping on an ambiguous signal.
+        """
         stripped = evaluation.strip().upper()
         if stripped.startswith("COMPLETE: YES"):
             state.metadata["task_complete"] = True
-        elif stripped.startswith("COMPLETE: NO"):
-            state.metadata["task_complete"] = False
         else:
-            state.metadata["task_complete"] = len(state.errors) == 0
+            state.metadata["task_complete"] = False
 
     def _evaluate_heuristic(self, state: AgentState) -> None:
         """Fallback heuristic-based evaluation."""

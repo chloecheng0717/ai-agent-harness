@@ -326,7 +326,9 @@ class TestEvaluateResultCompletion:
             assert state.metadata.get("task_complete") is False
 
     @pytest.mark.asyncio
-    async def test_falls_back_to_errors_when_llm_verdict_unclear(self) -> None:
+    async def test_unclear_llm_verdict_is_not_complete(self) -> None:
+        """A verdict without an explicit COMPLETE: YES prefix must not stop
+        the loop, even when no errors were recorded."""
         provider = _make_provider()
         orch = Orchestrator(llm_provider=provider)
 
@@ -336,7 +338,7 @@ class TestEvaluateResultCompletion:
             state.goal = "test"
             state.results = [{"step_index": 0, "output": "ok"}]
             state = await orch.evaluate_result(state)
-            assert state.metadata.get("task_complete") is True  # no errors
+            assert state.metadata.get("task_complete") is False
 
 
 # ── Iterative loop (run) ─────────────────────────────────────────

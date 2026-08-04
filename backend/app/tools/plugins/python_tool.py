@@ -124,6 +124,7 @@ class PythonTool(BaseTool):
                 },
             },
             tags=["ctf", "python", "execute", "decode", "compute"],
+            timeout=_MAX_TIMEOUT,
             permissions=[ToolPermission.EXECUTE],
             risk_level=RiskLevel.HIGH,
             confirmation_required=ConfirmationRequirement.NEVER,

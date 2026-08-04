@@ -241,6 +241,50 @@ def extract_endpoint(text: str) -> tuple[str, int] | None:
     return None
 
 
+# ── Perceptron detection ──────────────────────────────────────────
+
+
+#: Strong, unambiguous perceptron-challenge wording.  The deterministic
+#: network plan hard-codes single-layer-perceptron training, so it must
+#: only be offered when the goal clearly targets that challenge.
+_PERCEPTRON_STRONG_SIGNALS = (
+    "perceptron",
+    "training point",
+    "linearly separable",
+    "w1",
+    "w2",
+)
+
+#: Weaker wording; combined with a strong signal it confirms the goal is
+#: the remote perceptron-training service rather than a generic network
+#: challenge.
+_PERCEPTRON_WEAK_SIGNALS = (
+    "weights",
+    "bias",
+    "classif",
+    "single-layer",
+    "labeled",
+)
+
+
+def is_perceptron_network(text: str) -> bool:
+    """
+    Whether *text* targets the remote perceptron-training challenge.
+
+    The deterministic socket plan trains a single-layer perceptron
+    (connect to the service, learn weights ``w1``/``w2`` and bias ``b``,
+    submit ``SET``/``CHECK``), so it is only activated for challenges that
+    actually ask for that.  A generic banner-grab or service-interaction
+    goal gets normal LLM planning instead.
+    """
+    lower = text.lower()
+    if "perceptron" in lower:
+        return True
+    strong = sum(1 for kw in _PERCEPTRON_STRONG_SIGNALS if kw in lower)
+    weak = sum(1 for kw in _PERCEPTRON_WEAK_SIGNALS if kw in lower)
+    return strong >= 2 or (strong >= 1 and weak >= 1)
+
+
 # ── Deterministic network plan ────────────────────────────────────
 
 #: Python socket code that connects to the service, reads the full banner,

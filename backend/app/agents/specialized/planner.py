@@ -25,6 +25,7 @@ from app.agents.core.challenge_classifier import (
     build_network_plan,
     classify_challenge,
     extract_endpoint,
+    is_perceptron_network,
 )
 from app.agents.core.tool_selector import ToolSelector
 from app.models.agent import AgentType
@@ -378,15 +379,21 @@ class PlannerAgent(BaseAgent):
         tools_available: list[str],
     ) -> dict[str, Any] | None:
         """
-        Return a complete, validated network plan when *goal* targets a
-        remote TCP service, or ``None`` to fall through to normal planning.
+        Return a complete, validated network plan when *goal* targets the
+        remote perceptron-training service, or ``None`` to fall through to
+        normal planning.
 
-        The plan uses the ``python`` tool with real socket code so the
-        agent interacts with the service instead of decoding the goal text.
+        The plan is perceptron-specific (it hard-codes training a
+        single-layer perceptron), so it is gated on perceptron wording: a
+        generic network goal gets ordinary LLM planning.  When used, the
+        plan runs the ``python`` tool with real socket code so the agent
+        interacts with the service instead of decoding the goal text.
         """
         if "python" not in tools_available:
             return None
         if classify_challenge(goal) != NETWORK:
+            return None
+        if not is_perceptron_network(goal):
             return None
         endpoint = extract_endpoint(goal)
         if endpoint is None:

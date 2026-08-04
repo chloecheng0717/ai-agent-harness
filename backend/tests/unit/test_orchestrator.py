@@ -22,6 +22,7 @@ from app.models.state import (
     PlanStep,
     StepStatus,
 )
+from app.models.tool import ToolResult
 
 
 # ── Orchestrator creation ───────────────────────────────────────
@@ -513,3 +514,129 @@ class TestDeterministicCompletionGuard:
         # No LLM provider → heuristic would say complete, guard must veto.
         assert state.metadata["task_complete"] is False
         assert state.metadata.get("replan_feedback")
+
+
+# ── Evaluator verdict parsing ──────────────────────────────────────
+
+
+class TestEvaluatorVerdictParsing:
+    """The evaluator must only complete on an explicit COMPLETE: YES."""
+
+    def test_yes_prefix_marks_complete(self) -> None:
+        orch = Orchestrator()
+        state = AgentState()
+        state.metadata["task_complete"] = False
+        orch._set_task_complete_from_eval(state, "COMPLETE: YES - flag recovered")
+        assert state.metadata["task_complete"] is True
+
+    def test_no_prefix_marks_incomplete(self) -> None:
+        orch = Orchestrator()
+        state = AgentState()
+        state.metadata["task_complete"] = True
+        orch._set_task_complete_from_eval(state, "COMPLETE: NO - still encoded")
+        assert state.metadata["task_complete"] is False
+
+    def test_malformed_reply_never_marks_complete(self) -> None:
+        orch = Orchestrator()
+        state = AgentState()
+        state.metadata["task_complete"] = True
+        orch._set_task_complete_from_eval(state, "The results look good, maybe done.")
+        assert state.metadata["task_complete"] is False
+
+    def test_malformed_reply_with_no_errors_is_not_complete(self) -> None:
+        """Regression: no-error prose must not silently complete the task."""
+        orch = Orchestrator()
+        state = AgentState()
+        orch._set_task_complete_from_eval(state, "no verdict prefix here")
+        assert state.metadata.get("task_complete") is False
+
+    def test_yes_prefix_case_insensitive(self) -> None:
+        orch = Orchestrator()
+        state = AgentState()
+        orch._set_task_complete_from_eval(state, "complete: yes, all done")
+        assert state.metadata["task_complete"] is True
+
+
+# ── Tool execution timeout ────────────────────────────────────────
+
+
+class _RecordingRegistry:
+    """ToolRegistry stand-in that captures every execution request."""
+
+    def __init__(self) -> None:
+        self.requests: list[Any] = []
+
+    def list_tools(self) -> list[dict[str, str]]:
+        return [{"name": "python"}]
+
+    async def execute(self, request: Any) -> ToolResult:
+        self.requests.append(request)
+        return ToolResult(success=True, output="ok")
+
+
+class TestExecutionTimeout:
+    @pytest.mark.asyncio
+    async def test_step_timeout_propagates_to_request(self) -> None:
+        """A step's ``_timeout`` must be honoured by the tool request."""
+        orch = Orchestrator()
+        registry = _RecordingRegistry()
+        orch.tool_registry = registry
+        state = AgentState()
+        state.metadata["workspace_id"] = "ws-1"
+        state.plan = [
+            PlanStep(
+                index=0,
+                description="run a long job",
+                tool_name="python",
+                tool_parameters={"code": "print('hi')", "_timeout": 60},
+            )
+        ]
+
+        state = await orch.execute_plan(state)
+
+        assert len(registry.requests) == 1
+        assert registry.requests[0].timeout == 60
+        assert "_timeout" not in registry.requests[0].parameters
+
+    @pytest.mark.asyncio
+    async def test_request_without_step_timeout_leaves_it_unset(self) -> None:
+        """Without a step timeout the request stays None so the registry
+        falls back to the tool definition's timeout."""
+        orch = Orchestrator()
+        registry = _RecordingRegistry()
+        orch.tool_registry = registry
+        state = AgentState()
+        state.metadata["workspace_id"] = "ws-1"
+        state.plan = [
+            PlanStep(
+                index=0,
+                description="run",
+                tool_name="python",
+                tool_parameters={"code": "print('hi')"},
+            )
+        ]
+
+        state = await orch.execute_plan(state)
+
+        assert len(registry.requests) == 1
+        assert registry.requests[0].timeout is None
+
+    @pytest.mark.asyncio
+    async def test_zero_step_timeout_ignored(self) -> None:
+        orch = Orchestrator()
+        registry = _RecordingRegistry()
+        orch.tool_registry = registry
+        state = AgentState()
+        state.metadata["workspace_id"] = "ws-1"
+        state.plan = [
+            PlanStep(
+                index=0,
+                description="run",
+                tool_name="python",
+                tool_parameters={"code": "print('hi')", "_timeout": 0},
+            )
+        ]
+
+        state = await orch.execute_plan(state)
+
+        assert registry.requests[0].timeout is None

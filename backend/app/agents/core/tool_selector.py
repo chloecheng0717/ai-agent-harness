@@ -194,13 +194,11 @@ class ToolSelector:
         available = list(available_tools)
         text = self._step_text(step).lower()
 
-        # 0. String-extraction intent beats metadata/generic tools.
-        #    A step that asks to pull hidden text out of a file, log, or
-        #    binary must use ``strings`` even when the LLM plan named
-        #    ``file`` (type inspection) or ``python`` (generic execution).
+        # 0. String-extraction intent picks ``strings`` for steps the LLM
+        #    left without a tool.  An explicit ``tool_name`` already present
+        #    on the step is always honoured (rule 1) and never overridden.
         if "strings" in available and self._string_extraction_intent(text):
-            explicit = self._step_field(step, "tool_name")
-            if explicit is None or explicit in _METADATA_OR_GENERIC_TOOLS:
+            if self._step_field(step, "tool_name") is None:
                 self.logger.debug(
                     "String-extraction intent selected strings tool",
                     step_text=text[:120],
