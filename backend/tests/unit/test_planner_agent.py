@@ -562,6 +562,24 @@ class TestParsePlanJson:
         steps = agent._parse_plan_json("not json")
         assert steps == []
 
+    def test_truncated_json_returns_empty_not_crash(self) -> None:
+        """A truncated reply (unterminated string) must not raise."""
+        agent = PlannerAgent()
+        steps = agent._parse_plan_json('[{"index": 0, "description": "unterminated')
+        assert steps == []
+
+    def test_prose_wrapped_json_parses(self) -> None:
+        """Prose around the JSON array must not force a fallback plan."""
+        agent = PlannerAgent()
+        data = (
+            "Here is the plan:\n"
+            f"{_sample_plan_json()}\n"
+            "Good luck!"
+        )
+        steps = agent._parse_plan_json(data)
+        assert len(steps) == 2
+        assert steps[0].tool_name == "nmap"
+
     def test_non_array_json(self) -> None:
         agent = PlannerAgent()
         steps = agent._parse_plan_json('{"key": "value"}')

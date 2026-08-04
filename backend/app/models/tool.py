@@ -133,8 +133,44 @@ class ToolDefinition(BaseModel):
     )
     sandbox_capability: SandboxCapability = Field(
         default=SandboxCapability.NONE,
-        description="Sandboxing requirements"
+        description="Sandboxing requirements",
     )
+
+    def parameter_summary(self) -> str:
+        """
+        Render the parameter schema as a compact, LLM-readable spec.
+
+        Each property is listed with its type/enum, a ``(required)``
+        marker when it is in the top-level ``required`` list, and its
+        description.  ``oneOf``/``anyOf`` "exactly one of" constraints
+        (used by tools that accept either ``path`` or ``content``) are
+        rendered as a single line so the LLM knows an argument is
+        mandatory.
+        """
+        lines: List[str] = []
+        params = self.parameters or {}
+        props = params.get("properties", {})
+        required = set(params.get("required", []))
+
+        for pname, pmeta in props.items():
+            ptype = pmeta.get("type", "any")
+            if isinstance(ptype, list):
+                ptype = " | ".join(str(t) for t in ptype)
+            enums = pmeta.get("enum")
+            suffix = " | ".join(str(e) for e in enums) if enums else ptype
+            flag = "(required)" if pname in required else ""
+            note = pmeta.get("description", "")
+            line = f"      {pname} ({suffix}) {flag}".rstrip()
+            if note:
+                line += f" -- {note}"
+            lines.append(line)
+
+        for alternative in params.get("oneOf") or params.get("anyOf") or []:
+            if isinstance(alternative, dict) and alternative.get("required"):
+                names = ", ".join(str(n) for n in alternative["required"])
+                lines.append(f"      one of: {names} -- exactly one required")
+
+        return "\n".join(lines)
 
 
 class ToolResult(BaseModel):

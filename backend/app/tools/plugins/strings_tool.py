@@ -42,7 +42,9 @@ class StringsTool(BaseTool):
             name="strings",
             description=(
                 "Extract printable strings from a file or buffer. "
-                "Supports configurable minimum string length."
+                "Requires exactly one of 'path' (a workspace file) or "
+                "'content' (raw text). Supports configurable minimum "
+                "string length."
             ),
             version="1.0.0",
             parameters={
@@ -50,7 +52,10 @@ class StringsTool(BaseTool):
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Path to the file to extract strings from",
+                        "description": (
+                            "Path to the file to extract strings from "
+                            "(e.g. '/workspace/payload.bin')"
+                        ),
                     },
                     "content": {
                         "type": "string",
@@ -65,6 +70,10 @@ class StringsTool(BaseTool):
                         "default": 4,
                     },
                 },
+                "oneOf": [
+                    {"required": ["path"]},
+                    {"required": ["content"]},
+                ],
             },
             returns={
                 "type": "object",

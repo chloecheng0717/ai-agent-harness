@@ -135,6 +135,45 @@ class _UnavailableProvider(BaseLLMProvider):
 # ── Simulated container ───────────────────────────────────────────
 
 
+class _TruncatedPlanProvider(_StubProvider):
+    """Returns a truncated JSON plan (unterminated string) for planning.
+
+    Reproduces the reported bug where ``json.loads`` blew up with
+    "Unterminated string starting at..." instead of falling back to the
+    template plan.  All non-planning prompts delegate to ``_StubProvider``.
+    """
+
+    def __init__(self) -> None:
+        super().__init__([])
+        self.plan_attempts = 0
+
+    async def chat_completion(
+        self,
+        request: ChatCompletionRequest,
+    ) -> ChatCompletionResponse:
+        system = next(
+            (m.content for m in request.messages if m.role == "system"),
+            "",
+        )
+        if "planning agent" in system:
+            self.plan_attempts += 1
+            return ChatCompletionResponse(
+                model="runctf-stub",
+                choices=[
+                    ChatCompletionChoice(
+                        message=ChatMessage(
+                            role="assistant",
+                            content=(
+                                '[{"index": 0, "description": "unterminated'
+                            ),
+                        )
+                    )
+                ],
+                usage=TokenUsageInfo(prompt_tokens=1, completion_tokens=1),
+            )
+        return await super().chat_completion(request)
+
+
 class _SimulatedContainer:
     """Executes tool commands against the host workspace directory."""
 
@@ -495,3 +534,32 @@ class TestRunChallengeFolder:
         assert result["llm_unavailable"] is True
         assert result["flag_found"] is False
         assert any("quota" in e for e in result["errors"])
+
+    @pytest.mark.asyncio
+    async def test_malformed_plan_json_does_not_crash(
+        self, tmp_path: Path, workspace_dir: str
+    ) -> None:
+        """Truncated LLM plan output must fall back, not crash the run.
+
+        Regression: `json.loads` on the raw LLM response raised
+        "Unterminated string starting at..." which aborted the run.  The
+        robust parser now returns None and the orchestrator falls back to
+        the template plan, so the run completes without an exception.
+        """
+        folder = _write_challenge_folder(tmp_path)
+        sandbox = _make_sandbox(workspace_dir)
+        provider = _TruncatedPlanProvider()
+
+        with _patched_client(sandbox):
+            result = await run_challenge_folder(
+                folder,
+                sandbox=sandbox,
+                llm_provider=provider,
+                max_iterations=2,
+            )
+
+        assert isinstance(result, dict)
+        assert provider.plan_attempts >= 2
+        assert result["llm_unavailable"] is False
+        assert result["status"] in ("completed", "failed")
+        assert result["flag_found"] is False

@@ -39,6 +39,7 @@ from app.models.state import (
     PlanStep,
     extract_llm_tool_name,
     extract_llm_tool_params,
+    parse_llm_plan_json,
 )
 
 if TYPE_CHECKING:
@@ -106,6 +107,11 @@ Tool guidance:
   as encoded data to decode, and do not re-read the same file or re-decode
   the same input more than once.
 - Keep planning until the flag text (matching 'flag{...}') is recovered.
+- Every step that names a tool MUST include the arguments that tool needs
+  in 'tool_parameters'.  In particular 'strings' requires 'path' or
+  'content', 'file' requires 'path' or 'content', 'encoding' requires
+  'input' and 'encoding', 'archive' requires 'archive_path', and 'python'
+  requires 'code'.  Never leave a tool step's tool_parameters empty.
 """
 
 _REVISE_SYSTEM_PROMPT = """\
@@ -674,18 +680,13 @@ class PlannerAgent(BaseAgent):
         """
         Parse an LLM JSON response into a list of PlanStep objects.
 
-        Handles markdown code fences and other common LLM quirks.
+        Delegates fence stripping and JSON recovery to
+        :func:`parse_llm_plan_json` so prose-wrapped or truncated LLM
+        output degrades to a fallback plan instead of crashing.
         """
-        cleaned = self._strip_code_fences(raw)
-
-        try:
-            data = json.loads(cleaned)
-        except json.JSONDecodeError as exc:
-            self.logger.warning("Failed to parse plan JSON", error=str(exc))
-            return []
-
-        if not isinstance(data, list):
-            self.logger.warning("Plan JSON is not an array", type=type(data).__name__)
+        data = parse_llm_plan_json(raw)
+        if data is None:
+            self.logger.warning("Failed to parse plan JSON")
             return []
 
         steps: List[PlanStep] = []
@@ -713,20 +714,6 @@ class PlannerAgent(BaseAgent):
                 )
 
         return steps
-
-    @staticmethod
-    def _strip_code_fences(text: str) -> str:
-        """Remove markdown code fences from LLM output."""
-        cleaned = text.strip()
-        if cleaned.startswith("```"):
-            lines = cleaned.split("\n")
-            # Remove first and last lines if they are fences
-            if lines[0].strip().startswith("```"):
-                lines = lines[1:]
-            if lines and lines[-1].strip() == "```":
-                lines = lines[:-1]
-            cleaned = "\n".join(lines)
-        return cleaned.strip()
 
     # ── Plan refinement (tool selection) ──────────────────────
 

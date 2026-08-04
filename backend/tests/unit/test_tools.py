@@ -159,6 +159,53 @@ class TestToolModels:
         assert definition.risk_level == RiskLevel.HIGH
         assert definition.confirmation_required == ConfirmationRequirement.HIGH_RISK
 
+    def test_tool_definition_parameter_summary_renders_one_of(self):
+        """parameter_summary() must surface oneOf constraints and required args.
+
+        Regression: the strings/file tools accepted either ``path`` or
+        ``content`` but the LLM metadata did not say an argument was
+        mandatory, so the model emitted empty ``tool_parameters``.
+        """
+        definition = ToolDefinition(
+            name="strings",
+            description="Extract printable strings from a binary.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Path to the binary file, e.g. /workspace/payload.bin",
+                    },
+                    "min_length": {"type": "integer", "default": 4},
+                    "content": {
+                        "type": "string",
+                        "description": "Raw binary data to scan",
+                    },
+                },
+                "required": ["path"],
+                "oneOf": [{"required": ["path"]}, {"required": ["content"]}],
+            },
+            returns={"type": "object", "properties": {}},
+        )
+        summary = definition.parameter_summary()
+
+        assert "path (string) (required)" in summary
+        assert "/workspace/payload.bin" in summary
+        assert "min_length (integer)" in summary
+        assert "content (string)" in summary
+        assert "one of: path -- exactly one required" in summary
+        assert "one of: content -- exactly one required" in summary
+
+    def test_tool_definition_parameter_summary_empty_schema(self):
+        """A tool without parameters renders an empty (non-crashing) summary."""
+        definition = ToolDefinition(
+            name="no_params",
+            description="Takes no arguments.",
+            parameters={},
+            returns={},
+        )
+        assert definition.parameter_summary() == ""
+
     def test_tool_result_success(self):
         """Test ToolResult for successful execution."""
         result = ToolResult(

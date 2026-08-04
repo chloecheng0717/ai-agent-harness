@@ -752,6 +752,62 @@ class TestBenchmarkRunnerPassesChallenges:
         assert result.final_answer == challenge.expected_flag
 
     @pytest.mark.asyncio
+    async def test_strings_empty_params_are_repaired(
+        self, workspace_dir: str
+    ) -> None:
+        """A strings step authored without arguments must still run.
+
+        Regression: the LLM selected the strings tool but emitted empty
+        ``tool_parameters``, which failed with "Either 'path' or 'content'
+        must be provided".  The orchestrator now deterministically fills
+        the missing path from the challenge seed file, so the tool runs
+        and the flag is recovered.
+        """
+        flag = "flag{hidden_strings_repaired}"
+        challenge = Challenge(
+            name="strings_empty_params",
+            category="file_analysis",
+            description="Recover the flag hidden in a binary.",
+            difficulty="easy",
+            goal=(
+                "Recover the CTF flag hidden among the printable strings "
+                "of /workspace/payload.bin."
+            ),
+            expected_flag=flag,
+            required_capabilities=["strings", "python"],
+            files={
+                "payload.bin": (
+                    b"\x00\x01\x02junk_bytes\x00\x00" + flag.encode() + b"\x00\x03"
+                )
+            },
+        )
+        plan = [
+            {
+                "index": 0,
+                "description": "Extract printable strings from the binary",
+                "tool_name": "strings",
+                "rationale": "The flag is hidden among printable strings.",
+                "tool_parameters": {},
+            }
+        ]
+        sandbox = _make_sandbox(workspace_dir)
+        runner = BenchmarkRunner(
+            settings=None,
+            sandbox=sandbox,
+            llm_provider=_StubProvider(plan),
+            max_iterations=1,
+        )
+
+        with _patched_client(sandbox):
+            result: ChallengeResult = await runner.run_challenge(challenge)
+
+        assert result.passed is True, result.errors
+        assert result.flag_found is True
+        assert result.status == "completed"
+        assert "strings" in result.tools_used
+        assert result.final_answer == flag
+
+    @pytest.mark.asyncio
     async def test_network_banner_flow_parses_signed_coords_and_persists(
         self, workspace_dir: str
     ) -> None:

@@ -159,6 +159,82 @@ def extract_llm_tool_name(item: dict[str, Any]) -> str | None:
     return name if isinstance(name, str) else None
 
 
+def _extract_json_array(text: str) -> str | None:
+    """
+    Extract the outermost balanced ``[...]`` JSON array from *text*,
+    ignoring any prose that surrounds it.
+
+    Returns ``None`` when no balanced array is present (e.g. the LLM's
+    reply was truncated mid-string).
+    """
+    start = text.find("[")
+    if start == -1:
+        return None
+    depth = 0
+    in_string = False
+    escaped = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == "[":
+            depth += 1
+        elif ch == "]":
+            depth -= 1
+            if depth == 0:
+                return text[start:i + 1]
+    return None
+
+
+def parse_llm_plan_json(raw: str) -> list[dict[str, Any]] | None:
+    """
+    Parse an LLM-authored plan into a list of step dicts.
+
+    Tolerates markdown code fences and prose wrapped around the JSON
+    array (the LLM frequently emits ``Here is the plan: [...]`` or wraps
+    it in `` ```json `` fences).  Returns ``None`` rather than raising
+    when no usable array can be recovered, so callers can fall back to a
+    deterministic planner instead of crashing the run.
+    """
+    if not isinstance(raw, str):
+        return None
+
+    cleaned = raw.strip()
+    if cleaned.startswith("```"):
+        lines = cleaned.split("\n")
+        if lines and lines[0].strip().startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        cleaned = "\n".join(lines).strip()
+
+    try:
+        data = json.loads(cleaned)
+    except ValueError:
+        data = None
+    if data is not None:
+        # Valid JSON that is not an array is not a plan — bail out so the
+        # caller's fallback planner runs.
+        return data if isinstance(data, list) else None
+
+    fragment = _extract_json_array(cleaned)
+    if fragment is None:
+        return None
+    try:
+        data = json.loads(fragment)
+    except ValueError:
+        return None
+    return data if isinstance(data, list) else None
+
+
 class AgentState(BaseModel):
     """
     Shared state model for the agent runtime engine.

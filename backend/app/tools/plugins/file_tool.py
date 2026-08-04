@@ -42,8 +42,8 @@ class FileTool(BaseTool):
             name="file",
             description=(
                 "Identify the type of a file or buffer. "
-                "Supply either 'path' (file path inside the workspace) "
-                "or 'content' (raw bytes as a string)."
+                "Requires exactly one of 'path' (a file path inside the "
+                "workspace) or 'content' (raw bytes as a string)."
             ),
             version="1.0.0",
             parameters={
@@ -51,7 +51,10 @@ class FileTool(BaseTool):
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Path to the file to identify",
+                        "description": (
+                            "Path to the file to identify "
+                            "(e.g. '/workspace/payload.bin')"
+                        ),
                     },
                     "content": {
                         "type": "string",
@@ -61,6 +64,10 @@ class FileTool(BaseTool):
                         ),
                     },
                 },
+                "oneOf": [
+                    {"required": ["path"]},
+                    {"required": ["content"]},
+                ],
             },
             returns={
                 "type": "object",

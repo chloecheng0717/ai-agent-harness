@@ -44,6 +44,7 @@ from app.models.state import (
     StepStatus,
     extract_llm_tool_name,
     extract_llm_tool_params,
+    parse_llm_plan_json,
 )
 from app.models.task import TaskStatus
 from app.models.tool import ToolExecutionRequest, ToolPermission
@@ -275,6 +276,10 @@ class Orchestrator:
                 parts.append(f"  - {name}: {defn.description}")
             else:
                 parts.append(f"  - {name}")
+            if defn and defn.parameters:
+                summary = defn.parameter_summary()
+                if summary:
+                    parts.append(summary)
         return "\n".join(parts)
 
     def _plan_context(self, state: AgentState) -> str:
@@ -901,8 +906,8 @@ class Orchestrator:
             ]
             try:
                 raw = await self._llm_chat(messages, state)
-                plan_data = __import__("json").loads(raw)
-                if isinstance(plan_data, list):
+                plan_data = parse_llm_plan_json(raw)
+                if plan_data is not None:
                     state.plan = [
                         PlanStep(
                             index=item.get("index", i),

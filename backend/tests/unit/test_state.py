@@ -25,6 +25,7 @@ from app.models.state import (
     TokenUsage,
     extract_llm_tool_name,
     extract_llm_tool_params,
+    parse_llm_plan_json,
 )
 
 
@@ -172,6 +173,64 @@ class TestExtractLLMToolName:
         assert extract_llm_tool_name({}) is None
         assert extract_llm_tool_name({"tool": None}) is None
         assert extract_llm_tool_name({"tool": 42}) is None
+
+
+# ── LLM plan JSON parsing ────────────────────────────────────────
+
+
+class TestParseLLMPlanJson:
+    """Regression tests for robust parsing of LLM plan output.
+
+    LLMs wrap plans in markdown fences and prose, or truncate them
+    mid-string.  ``parse_llm_plan_json`` must recover usable arrays and
+    return ``None`` (never raise) for unusable output so the caller's
+    fallback planner runs instead of crashing.
+    """
+
+    def test_valid_array(self) -> None:
+        data = parse_llm_plan_json(
+            '[{"index": 0, "description": "run", "tool_name": "strings"}]'
+        )
+        assert data == [{"index": 0, "description": "run", "tool_name": "strings"}]
+
+    def test_markdown_fenced_array(self) -> None:
+        raw = "```json\n[{\"index\": 0, \"description\": \"run\"}]\n```"
+        data = parse_llm_plan_json(raw)
+        assert data == [{"index": 0, "description": "run"}]
+
+    def test_prose_wrapped_array(self) -> None:
+        """Prose before/after the array used to break json.loads."""
+        raw = (
+            "Here is the plan:\n"
+            '[{"index": 0, "description": "extract strings"}]\n'
+            "Good luck!"
+        )
+        data = parse_llm_plan_json(raw)
+        assert data == [{"index": 0, "description": "extract strings"}]
+
+    def test_prose_and_fences_wrapped_array(self) -> None:
+        raw = (
+            "Sure thing:\n```json\n"
+            '[{"index": 0, "description": "decode"}, {"index": 1, "description": "done"}]\n'
+            "```\nHope this helps."
+        )
+        data = parse_llm_plan_json(raw)
+        assert len(data) == 2
+
+    def test_unterminated_string_returns_none(self) -> None:
+        """A truncated reply must not crash the run."""
+        raw = '[{"index": 0, "description": "unterminated'
+        assert parse_llm_plan_json(raw) is None
+
+    def test_valid_but_not_array_returns_none(self) -> None:
+        assert parse_llm_plan_json('{"key": "value"}') is None
+
+    def test_invalid_text_returns_none(self) -> None:
+        assert parse_llm_plan_json("not json at all") is None
+
+    def test_empty_and_non_string_returns_none(self) -> None:
+        assert parse_llm_plan_json("") is None
+        assert parse_llm_plan_json(None) is None  # type: ignore[arg-type]
 
 
 # ── AgentState ──────────────────────────────────────────────────

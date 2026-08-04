@@ -31,6 +31,7 @@ from app.models.state import (
     PlanStep,
     extract_llm_tool_name,
     extract_llm_tool_params,
+    parse_llm_plan_json,
 )
 
 
@@ -162,18 +163,9 @@ class BenchmarkOrchestrator(Orchestrator):
             else:
                 parts.append(f"  - {name}")
             if defn and defn.parameters:
-                props = defn.parameters.get("properties", {})
-                required = set(defn.parameters.get("required", []))
-                for pname, pmeta in props.items():
-                    ptype = pmeta.get("type", "any")
-                    enums = pmeta.get("enum")
-                    suffix = " | ".join(enums) if enums else ptype
-                    flag = "(required)" if pname in required else ""
-                    note = pmeta.get("description", "")
-                    line = f"      {pname} ({suffix}) {flag}"
-                    if note:
-                        line += f" -- {note}"
-                    parts.append(line.rstrip())
+                summary = defn.parameter_summary()
+                if summary:
+                    parts.append(summary)
         return "\n".join(parts)
 
     async def create_plan(self, state: AgentState) -> AgentState:
@@ -213,7 +205,8 @@ class BenchmarkOrchestrator(Orchestrator):
             "Tool guidance:\n"
             "- Use 'strings' to extract hidden/embedded/printable text from "
             "files, logs, and binaries. Prefer it whenever the goal is to "
-            "find hidden text inside a file.\n"
+            "find hidden text inside a file. ALWAYS supply 'path' (a file "
+            "in the workspace) or 'content' for every 'strings' step.\n"
             "- Use 'file' ONLY to inspect a file's type or metadata (MIME "
             "type, magic bytes, signature). Never use it as the only step "
             "when the goal is to recover hidden content.\n"
@@ -240,19 +233,8 @@ class BenchmarkOrchestrator(Orchestrator):
 
         try:
             raw = await self._llm_chat([system_msg, user_msg], state)
-            raw = raw.strip()
-            if raw.startswith("```"):
-                first_nl = raw.find("\n")
-                if first_nl != -1:
-                    raw = raw[first_nl + 1:]
-                if raw.endswith("```"):
-                    raw = raw[:-3]
-                elif "```" in raw:
-                    raw = raw.rsplit("```", 1)[0]
-                raw = raw.strip()
-
-            plan_data = json.loads(raw)
-            if isinstance(plan_data, list):
+            plan_data = parse_llm_plan_json(raw)
+            if plan_data is not None:
                 state.plan = [
                     PlanStep(
                         index=item.get("index", i),
@@ -264,6 +246,12 @@ class BenchmarkOrchestrator(Orchestrator):
                     for i, item in enumerate(plan_data)
                 ]
                 state.metadata["plan_source"] = "benchmark_llm"
+            else:
+                self.logger.warning(
+                    "LLM plan parsing failed, falling back to base planner",
+                    error="no usable JSON array recovered",
+                )
+                state = await super().create_plan(state)
         except LLMUnavailableError:
             raise
         except Exception as exc:
@@ -276,6 +264,65 @@ class BenchmarkOrchestrator(Orchestrator):
         if self.verbose:
             self._print_plan(state)
         return state
+
+    #: Tools that operate on a workspace file path, mapped to the parameter
+    #: that carries the path.  The LLM frequently selects these without
+    #: authoring the path, so the parameter is repaired deterministically.
+    _PATH_TOOLS: dict[str, str] = {
+        "strings": "path",
+        "file": "path",
+        "archive": "archive_path",
+    }
+
+    #: Tools that accept raw ``content`` as a full alternative to the path.
+    _CONTENT_ALTERNATIVE_TOOLS = frozenset({"strings", "file"})
+
+    async def select_tools(self, state: AgentState) -> AgentState:
+        """Assign tools, then repair missing path parameters on the plan."""
+        state = await super().select_tools(state)
+        self._repair_plan_parameters(state)
+        return state
+
+    def _repair_plan_parameters(self, state: AgentState) -> None:
+        """
+        Deterministically fill missing path arguments for path-based tools.
+
+        The LLM sometimes selects tools like ``strings`` without authoring
+        a ``path`` argument, which makes execution fail with "Either
+        'path' or 'content' must be provided".  When the challenge ships
+        seed files and a step's parameters are missing the path-type input
+        (and no ``content`` alternative is given), the first seed file is
+        used so the step can actually run.
+        """
+        if not self.challenge_files:
+            return
+        seed_names = sorted(
+            rel.lstrip("/\\").replace("\\", "/")
+            for rel in self.challenge_files
+        )
+        if not seed_names:
+            return
+        for step in state.plan:
+            path_param = self._PATH_TOOLS.get(step.tool_name or "")
+            if path_param is None:
+                continue
+            params = dict(step.tool_parameters or {})
+            if params.get(path_param):
+                continue
+            if (
+                step.tool_name in self._CONTENT_ALTERNATIVE_TOOLS
+                and params.get("content") is not None
+            ):
+                continue
+            params[path_param] = "/workspace/" + seed_names[0]
+            step.tool_parameters = params
+            self.logger.info(
+                "Filled missing tool path parameter",
+                tool_name=step.tool_name,
+                step_index=step.index,
+                param=path_param,
+                value=params[path_param],
+            )
 
     def _print_plan(self, state: AgentState) -> None:
         print("\n===== PLAN =====")
