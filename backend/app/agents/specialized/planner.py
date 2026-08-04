@@ -35,7 +35,11 @@ from app.models.llm import (
     LLMProviderError,
     LLMUnavailableError,
 )
-from app.models.state import PlanStep
+from app.models.state import (
+    PlanStep,
+    extract_llm_tool_name,
+    extract_llm_tool_params,
+)
 
 if TYPE_CHECKING:
     from app.memory.manager import MemoryManager
@@ -692,8 +696,8 @@ class PlannerAgent(BaseAgent):
                 step = PlanStep(
                     index=item.get("index", i),
                     description=str(item.get("description", f"Step {i}")),
-                    tool_name=item.get("tool_name"),
-                    tool_parameters=item.get("tool_parameters") or {},
+                    tool_name=extract_llm_tool_name(item),
+                    tool_parameters=extract_llm_tool_params(item),
                     depends_on=item.get("depends_on") or [],
                     rationale=item.get("rationale", ""),
                     priority=item.get("priority", "medium"),

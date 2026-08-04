@@ -23,6 +23,8 @@ from app.models.state import (
     StepRecord,
     StepStatus,
     TokenUsage,
+    extract_llm_tool_name,
+    extract_llm_tool_params,
 )
 
 
@@ -110,6 +112,66 @@ class TestPlanStep:
         )
         assert step.tool_name == "nmap"
         assert step.depends_on == [0]
+
+
+# ── LLM plan key normalization ───────────────────────────────────
+
+
+class TestExtractLLMToolParams:
+    """Regression tests for LLM plan key normalization.
+
+    Models sometimes author plan steps with tool-call style keys
+    (``args``, ``tool``) instead of the documented ``tool_parameters`` /
+    ``tool_name``.  The arguments must survive parsing, otherwise a step
+    that was supposed to run ``python`` with real ``code`` ends up with an
+    empty parameter dict and fails with "Either 'code' or 'script_path'
+    must be provided".
+    """
+
+    def test_canonical_tool_parameters_dict(self) -> None:
+        params = extract_llm_tool_params({"tool_parameters": {"code": "x"}})
+        assert params == {"code": "x"}
+
+    def test_args_alias_used_when_tool_parameters_missing(self) -> None:
+        params = extract_llm_tool_params({"args": {"code": "print(1)"}})
+        assert params == {"code": "print(1)"}
+
+    def test_args_json_string_is_parsed(self) -> None:
+        params = extract_llm_tool_params({"args": '{"code": "print(1)"}'})
+        assert params == {"code": "print(1)"}
+
+    def test_tool_parameters_preferred_over_args(self) -> None:
+        params = extract_llm_tool_params(
+            {"tool_parameters": {"a": 1}, "args": {"b": 2}}
+        )
+        assert params == {"a": 1}
+
+    def test_missing_or_invalid_params_returns_empty(self) -> None:
+        assert extract_llm_tool_params({}) == {}
+        assert extract_llm_tool_params({"tool_parameters": None}) == {}
+        assert extract_llm_tool_params({"args": 42}) == {}
+        assert extract_llm_tool_params({"args": "not json"}) == {}
+
+
+class TestExtractLLMToolName:
+    """Regression tests for tool-name key normalization."""
+
+    def test_canonical_tool_name(self) -> None:
+        assert extract_llm_tool_name({"tool_name": "python"}) == "python"
+
+    def test_tool_alias_used_when_tool_name_missing(self) -> None:
+        assert extract_llm_tool_name({"tool": "python"}) == "python"
+
+    def test_tool_name_preferred_over_tool(self) -> None:
+        assert (
+            extract_llm_tool_name({"tool_name": "python", "tool": "nmap"})
+            == "python"
+        )
+
+    def test_missing_or_non_string_returns_none(self) -> None:
+        assert extract_llm_tool_name({}) is None
+        assert extract_llm_tool_name({"tool": None}) is None
+        assert extract_llm_tool_name({"tool": 42}) is None
 
 
 # ── AgentState ──────────────────────────────────────────────────

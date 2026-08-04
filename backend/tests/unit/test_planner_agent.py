@@ -297,6 +297,45 @@ class TestProcessWithLLM:
         assert result["success"] is True
         assert len(result["plan"]) == 2
 
+    @pytest.mark.asyncio
+    async def test_preserves_tool_args_alias_keys(self) -> None:
+        """LLM `tool`/`args` keys must be preserved as PlanStep fields.
+
+        Regression test: a model may author plan steps with tool-call
+        style keys (`tool`, `args`) instead of the documented
+        `tool_name`/`tool_parameters`.  The arguments were previously
+        dropped, leaving an empty parameters dict and a python step that
+        could not run.
+        """
+        provider = _make_provider()
+        agent = PlannerAgent(llm_provider=provider)
+        args_plan = json.dumps([
+            {
+                "index": 0,
+                "description": "Decode the flag from the message file",
+                "tool": "python",
+                "args": {
+                    "code": "print(open('/workspace/message.txt').read())"
+                },
+                "depends_on": [],
+                "rationale": "The file holds encoded text.",
+                "priority": "high",
+            }
+        ])
+
+        with patch.object(provider, "chat_completion", new_callable=AsyncMock) as mock:
+            mock.return_value = _make_llm_response(args_plan)
+            result = await agent.process({
+                "goal": "decode the flag",
+                "tools_available": ["python"],
+            })
+
+        assert result["success"] is True
+        assert result["plan"][0]["tool_name"] == "python"
+        assert result["plan"][0]["tool_parameters"] == {
+            "code": "print(open('/workspace/message.txt').read())"
+        }
+
 
 # ── Plan validation ──────────────────────────────────────────────
 

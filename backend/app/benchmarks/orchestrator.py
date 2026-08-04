@@ -26,7 +26,12 @@ import structlog
 
 from app.agents.core.orchestrator import Orchestrator
 from app.models.llm import ChatMessage, LLMUnavailableError
-from app.models.state import AgentState, PlanStep
+from app.models.state import (
+    AgentState,
+    PlanStep,
+    extract_llm_tool_name,
+    extract_llm_tool_params,
+)
 
 
 class BenchmarkOrchestrator(Orchestrator):
@@ -252,9 +257,9 @@ class BenchmarkOrchestrator(Orchestrator):
                     PlanStep(
                         index=item.get("index", i),
                         description=item.get("description", f"Step {i}"),
-                        tool_name=item.get("tool_name"),
+                        tool_name=extract_llm_tool_name(item),
                         rationale=item.get("rationale", ""),
-                        tool_parameters=item.get("tool_parameters", {}),
+                        tool_parameters=extract_llm_tool_params(item),
                     )
                     for i, item in enumerate(plan_data)
                 ]

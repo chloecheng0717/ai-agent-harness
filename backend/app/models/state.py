@@ -6,6 +6,7 @@ AgentState is the single source of truth that flows through the entire
 lifecycle: analysis → planning → tool selection → execution → validation → reflection.
 """
 
+import json
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Dict, List, Optional
@@ -121,6 +122,41 @@ class PlanStep(BaseModel):
         default=None,
         description="Description of expected output from this step",
     )
+
+
+def extract_llm_tool_params(item: dict[str, Any]) -> dict[str, Any]:
+    """
+    Extract tool arguments from an LLM-authored plan step.
+
+    The planning prompts use the canonical ``tool_parameters`` key, but
+    some models instead emit ``args`` (OpenAI/Anthropic tool-call style),
+    sometimes as a JSON-encoded string.  Accept both so arguments such as
+    ``{"code": "..."}`` survive parsing into a :class:`PlanStep`.
+    """
+    params: Any = item.get("tool_parameters")
+    if params is None:
+        params = item.get("args")
+    if isinstance(params, str):
+        try:
+            params = json.loads(params)
+        except (json.JSONDecodeError, TypeError):
+            return {}
+    if not isinstance(params, dict):
+        return {}
+    return params
+
+
+def extract_llm_tool_name(item: dict[str, Any]) -> str | None:
+    """
+    Extract the tool name from an LLM-authored plan step.
+
+    Accepts both ``tool_name`` (canonical schema) and ``tool`` (common
+    tool-call style) so the LLM's intended tool is preserved.
+    """
+    name: Any = item.get("tool_name")
+    if name is None:
+        name = item.get("tool")
+    return name if isinstance(name, str) else None
 
 
 class AgentState(BaseModel):

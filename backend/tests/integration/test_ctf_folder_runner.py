@@ -289,6 +289,30 @@ def _decode_plan() -> list[dict[str, Any]]:
     ]
 
 
+def _args_plan() -> list[dict[str, Any]]:
+    """Same step authored with tool-call style keys (`tool`/`args`).
+
+    Reproduces the reported bug: the LLM emitted `args` instead of
+    `tool_parameters`, so the `code` argument was dropped before the
+    python tool ran.
+    """
+    return [
+        {
+            "index": 0,
+            "description": "Decode the base64 message to recover the flag",
+            "tool": "python",
+            "rationale": "The message is base64 text in the workspace.",
+            "args": {
+                "code": (
+                    "import base64\n"
+                    "data = open('/workspace/message.txt').read().strip()\n"
+                    "print(base64.b64decode(data).decode())\n"
+                )
+            },
+        }
+    ]
+
+
 # ═══════════════════════════════════════════════════════════════════
 # Tests
 # ═══════════════════════════════════════════════════════════════════
@@ -423,6 +447,35 @@ class TestRunChallengeFolder:
         assert "python" in result["tools_used"]
         assert "flag{from_run_ctf}" in result["final_answer"]
         assert result["llm_unavailable"] is False
+
+    @pytest.mark.asyncio
+    async def test_preserves_llm_args_keys_into_plan(
+        self, tmp_path: Path, workspace_dir: str
+    ) -> None:
+        """LLM plans authored with `tool`/`args` keys must keep their args.
+
+        Regression test: the LLM sometimes returns tool-call style keys
+        (`tool`, `args`) instead of the documented `tool_name`/
+        `tool_parameters`.  Previously the `code` argument was dropped and
+        the python step failed with "Either 'code' or 'script_path' must
+        be provided".  The recovered flag proves the arguments flowed
+        through PlanStep -> ToolExecutionRequest -> python tool.
+        """
+        folder = _write_challenge_folder(tmp_path)
+        sandbox = _make_sandbox(workspace_dir)
+
+        with _patched_client(sandbox):
+            result = await run_challenge_folder(
+                folder,
+                sandbox=sandbox,
+                llm_provider=_StubProvider(_args_plan()),
+                max_iterations=2,
+            )
+
+        assert result["flag_found"] is True, result["errors"]
+        assert result["flags"] == ["flag{from_run_ctf}"]
+        assert "python" in result["tools_used"]
+        assert "flag{from_run_ctf}" in result["final_answer"]
 
     @pytest.mark.asyncio
     async def test_reports_llm_unavailable(

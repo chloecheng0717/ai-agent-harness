@@ -42,6 +42,8 @@ from app.models.state import (
     PlanStep,
     StepRecord,
     StepStatus,
+    extract_llm_tool_name,
+    extract_llm_tool_params,
 )
 from app.models.task import TaskStatus
 from app.models.tool import ToolExecutionRequest, ToolPermission
@@ -905,8 +907,9 @@ class Orchestrator:
                         PlanStep(
                             index=item.get("index", i),
                             description=item.get("description", f"Step {i}"),
-                            tool_name=item.get("tool_name"),
+                            tool_name=extract_llm_tool_name(item),
                             rationale=item.get("rationale", ""),
+                            tool_parameters=extract_llm_tool_params(item),
                         )
                         for i, item in enumerate(plan_data)
                     ]
