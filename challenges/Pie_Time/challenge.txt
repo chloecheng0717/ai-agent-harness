@@ -1,0 +1,12 @@
+Title:
+PIE TIME
+
+Description:
+Can you try to get the flag? Beware we have PIE!
+
+Connect to the program with netcat:
+
+$ nc rescued-float.picoctf.net 61519 
+The program's source code can be downloaded https://challenge-files.picoctf.net/c_rescued_float/104935b5fd5efcea1bc050d964ac91237c79eac916f57aef8e6407af232066ae/vuln.c
+
+The binary can be downloaded https://challenge-files.picoctf.net/c_rescued_float/104935b5fd5efcea1bc050d964ac91237c79eac916f57aef8e6407af232066ae/vuln

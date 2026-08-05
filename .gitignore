@@ -59,3 +59,6 @@ Thumbs.db
 # Local configuration
 .local/
 *.local
+
+.agents/
+skills-lock.json
