@@ -224,9 +224,13 @@ class Orchestrator:
             LifecycleStep.RESPOND: self.respond,
         }
 
-        # Caches successful tool outputs within one plan-execute cycle so
-        # identical tool calls are never repeated.  Cleared each iteration.
+        # Caches successful tool outputs so identical tool calls are never
+        # repeated.  Persists across the whole run (not just one plan-execute
+        # cycle) so cross-iteration duplicates reuse the prior result instead
+        # of re-invoking the tool.  Bounded so large outputs cannot grow the
+        # cache without limit.
         self._execution_cache: dict[str, dict[str, Any]] = {}
+        self._execution_cache_max: int = 200
 
         self.logger.info(
             "Orchestrator initialised",
@@ -339,6 +343,30 @@ class Orchestrator:
             ]
             parts.append(
                 "Previous plan steps: " + " -> ".join(prev_descs)
+            )
+        observation_log = state.metadata.get("observation_log")
+        if observation_log:
+            lines: List[str] = []
+            for entry in observation_log:
+                status = "ok" if entry.get("success") else "FAILED"
+                tool = entry.get("tool_name") or "?"
+                params = json.dumps(
+                    entry.get("parameters") or {}, sort_keys=True
+                )
+                if len(params) > 120:
+                    params = params[:120] + "..."
+                attempted = entry.get("times_attempted", 1)
+                repeat = f" (tried {attempted}x)" if attempted > 1 else ""
+                line = f"  - [{status}] {tool}({params}){repeat}"
+                preview = (entry.get("output_preview") or "").strip()
+                if preview:
+                    line += f" -> {preview}"
+                lines.append(line)
+            parts.append(
+                "Tool outputs already gathered this run (DO NOT re-run any "
+                "of these calls with identical arguments — reuse the outputs "
+                "above and change strategy):\n"
+                + "\n".join(lines)
             )
         return "\n".join(parts)
 
@@ -559,7 +587,11 @@ class Orchestrator:
                 )
 
                 if iteration > 1:
-                    # Stash previous execution context before clearing
+                    # Stash previous execution context before clearing.
+                    # Per-iteration results/errors are discarded but the
+                    # observation log and the tool-result cache survive, so
+                    # the next plan can see what was already tried and reuse
+                    # its outputs instead of repeating the same actions.
                     if state.errors:
                         state.metadata["replan_errors"] = state.errors.copy()
                     if state.plan:
@@ -570,7 +602,6 @@ class Orchestrator:
                     state.results.clear()
                     state.errors.clear()
                     state.tools_used.clear()
-                    self._execution_cache.clear()
 
                 for step in _inner_steps:
                     state = await self._run_step(step, state)
@@ -583,6 +614,20 @@ class Orchestrator:
                     break
 
                 self._update_progress_tracking(state, iteration)
+
+                # Deterministic early stop: the same tool calls have produced
+                # the same output for several consecutive iterations, so
+                # further LLM plan/evaluate cycles would only burn tokens
+                # without new information.  Reflect/respond still run below.
+                if state.metadata.get("no_progress_streak", 0) >= 2:
+                    state.metadata["stopped_no_progress"] = True
+                    self.logger.warning(
+                        "Stopping early: identical tool calls produced "
+                        "identical output across iterations",
+                        streak=state.metadata.get("no_progress_streak"),
+                        iteration=iteration,
+                    )
+                    break
 
                 self.logger.info(
                     "Task not yet complete — re-planning",
@@ -1126,6 +1171,13 @@ class Orchestrator:
                                     "step_index": plan_step.index,
                                     "output": tool_result.output,
                                 }
+                                if (
+                                    len(self._execution_cache)
+                                    > self._execution_cache_max
+                                ):
+                                    self._execution_cache.pop(
+                                        next(iter(self._execution_cache))
+                                    )
                         except Exception as exc:
                             result["success"] = False
                             result["error"] = str(exc)
@@ -1145,8 +1197,57 @@ class Orchestrator:
                 )
 
             state.results.append(result)
+            self._record_observation(state, plan_step, result)
 
         return state
+
+    def _record_observation(
+        self,
+        state: AgentState,
+        plan_step: PlanStep,
+        result: Dict[str, Any],
+    ) -> None:
+        """
+        Record a compact, persistent observation for a tool call.
+
+        Unlike ``state.results`` (cleared every iteration), the observation
+        log survives across iterations so the next plan can see what was
+        already tried and what it returned.  Entries are de-duplicated by
+        ``(tool, parameters)`` so repeated identical calls only bump
+        ``times_attempted`` instead of bloating the plan context, and the
+        log is capped to keep prompt tokens bounded.
+        """
+        if not plan_step.tool_name:
+            return
+        log = state.metadata.setdefault("observation_log", [])
+        signature = (
+            f"{plan_step.tool_name}:"
+            + json.dumps(plan_step.tool_parameters or {}, sort_keys=True)
+        )
+        preview = self._result_output_text(result).strip()
+        if len(preview) > 200:
+            preview = preview[:200] + "..."
+        for entry in log:
+            if entry.get("signature") == signature:
+                entry["success"] = bool(result.get("success"))
+                entry["output_preview"] = preview
+                entry["times_attempted"] = entry.get("times_attempted", 1) + 1
+                entry["iteration"] = state.metadata.get("iteration", 1)
+                return
+        log.append(
+            {
+                "signature": signature,
+                "iteration": state.metadata.get("iteration", 1),
+                "step_index": plan_step.index,
+                "tool_name": plan_step.tool_name,
+                "parameters": plan_step.tool_parameters or {},
+                "success": bool(result.get("success")),
+                "output_preview": preview,
+                "times_attempted": 1,
+            }
+        )
+        if len(log) > 50:
+            del log[: len(log) - 50]
 
     async def evaluate_result(self, state: AgentState) -> AgentState:
         """

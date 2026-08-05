@@ -427,8 +427,31 @@ class TestIterativeLoop:
 
         orch._step_registry[LifecycleStep.EVALUATE_RESULT] = original
 
+    @pytest.mark.asyncio
+    async def test_stops_early_when_no_progress(self) -> None:
+        """Identical tool calls and identical output across iterations must
+        stop the loop deterministically before max_iterations is reached."""
+        orch = Orchestrator(max_iterations=5)
 
-# ── Deterministic completion guard ────────────────────────────────
+        async def never_complete(state: AgentState) -> AgentState:
+            state.add_error("always fails")
+            state.metadata["task_complete"] = False
+            return state
+
+        original = orch._step_registry[LifecycleStep.EVALUATE_RESULT]
+        orch._step_registry[LifecycleStep.EVALUATE_RESULT] = never_complete
+
+        result = await orch.run(
+            task_id=uuid4(),
+            task_data={"description": "hopeless"},
+        )
+
+        assert result["status"] == "completed"
+        # 2 init + (4 steps × 3 iterations) + 2 final = 16 records.
+        # Without the early stop, 5 iterations would produce 24 records.
+        assert len(result["step_history"]) == 16
+
+        orch._step_registry[LifecycleStep.EVALUATE_RESULT] = original
 
 
 class TestDeterministicCompletionGuard:
@@ -676,3 +699,125 @@ class TestExecutionTimeout:
         state = await orch.execute_plan(state)
 
         assert registry.requests[0].timeout is None
+
+
+# ── Persistent tool cache (cross-iteration) ───────────────────────
+
+
+class TestPersistentToolCache:
+    """The tool-result cache must survive plan-execute cycle boundaries so
+    cross-iteration duplicate tool calls are not executed twice."""
+
+    @pytest.mark.asyncio
+    async def test_reuses_output_from_previous_iteration(self) -> None:
+        orch = Orchestrator()
+        registry = _RecordingRegistry()
+        orch.tool_registry = registry
+        plan = [
+            PlanStep(
+                index=0,
+                description="scan",
+                tool_name="python",
+                tool_parameters={"code": "print('hi')"},
+            )
+        ]
+
+        first = AgentState()
+        first.plan = list(plan)
+        first = await orch.execute_plan(first)
+        assert len(registry.requests) == 1
+
+        second = AgentState()
+        second.plan = list(plan)
+        second = await orch.execute_plan(second)
+
+        assert len(registry.requests) == 1
+        assert second.results[0]["reused_output_of"] == 0
+
+    @pytest.mark.asyncio
+    async def test_different_parameters_are_not_reused(self) -> None:
+        orch = Orchestrator()
+        registry = _RecordingRegistry()
+        orch.tool_registry = registry
+
+        first = AgentState()
+        first.plan = [
+            PlanStep(
+                index=0,
+                description="a",
+                tool_name="python",
+                tool_parameters={"code": "print('a')"},
+            )
+        ]
+        await orch.execute_plan(first)
+
+        second = AgentState()
+        second.plan = [
+            PlanStep(
+                index=0,
+                description="b",
+                tool_name="python",
+                tool_parameters={"code": "print('b')"},
+            )
+        ]
+        await orch.execute_plan(second)
+
+        assert len(registry.requests) == 2
+        assert "reused_output_of" not in second.results[0]
+
+
+# ── Observation memory (persistent, planner-visible) ──────────────
+
+
+class TestObservationMemory:
+    def test_records_compact_observation(self) -> None:
+        orch = Orchestrator()
+        state = AgentState()
+        state.metadata["iteration"] = 1
+        step = PlanStep(
+            index=0,
+            description="inspect",
+            tool_name="file",
+            tool_parameters={"path": "/workspace/app.py"},
+        )
+        orch._record_observation(
+            state,
+            step,
+            {"step_index": 0, "success": False, "output": "No such file"},
+        )
+        log = state.metadata["observation_log"]
+        assert len(log) == 1
+        assert log[0]["tool_name"] == "file"
+        assert log[0]["parameters"] == {"path": "/workspace/app.py"}
+        assert log[0]["success"] is False
+        assert log[0]["output_preview"] == "No such file"
+        assert log[0]["times_attempted"] == 1
+
+    def test_deduplicates_by_tool_and_parameters(self) -> None:
+        orch = Orchestrator()
+        state = AgentState()
+        step = PlanStep(
+            index=0,
+            description="inspect",
+            tool_name="file",
+            tool_parameters={"path": "/workspace/app.py"},
+        )
+        orch._record_observation(
+            state, step, {"step_index": 0, "output": "No such file"}
+        )
+        orch._record_observation(
+            state, step, {"step_index": 0, "output": "No such file"}
+        )
+        log = state.metadata["observation_log"]
+        assert len(log) == 1
+        assert log[0]["times_attempted"] == 2
+
+    def test_skips_steps_without_tools(self) -> None:
+        orch = Orchestrator()
+        state = AgentState()
+        orch._record_observation(
+            state,
+            PlanStep(index=0, description="think"),
+            {"step_index": 0, "output": "reasoning"},
+        )
+        assert state.metadata.get("observation_log") is None

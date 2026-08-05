@@ -462,3 +462,24 @@ class TestPlanContext:
         state.metadata["replan_feedback"] = "Use faster tool"
         ctx = orch._plan_context(state)
         assert "Use faster tool" in ctx
+
+    def test_observations_included_in_context(self) -> None:
+        orch = Orchestrator()
+        state = AgentState()
+        state.metadata["iteration"] = 2
+        step = PlanStep(
+            index=0,
+            description="inspect",
+            tool_name="file",
+            tool_parameters={"path": "/workspace/app.py"},
+        )
+        orch._record_observation(
+            state,
+            step,
+            {"step_index": 0, "success": False, "output": "No such file"},
+        )
+        ctx = orch._plan_context(state)
+        assert "Iteration: 2" in ctx
+        assert "/workspace/app.py" in ctx
+        assert "No such file" in ctx
+        assert "DO NOT re-run" in ctx

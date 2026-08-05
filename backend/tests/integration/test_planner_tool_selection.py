@@ -380,6 +380,37 @@ class TestDeduplication:
         assert counting.call_count == 1
         assert state.results[1]["reused_output_of"] == 0
 
+    @pytest.mark.asyncio
+    async def test_orchestrator_cache_persists_across_iterations(self) -> None:
+        """The tool-result cache must survive plan-execute cycle boundaries:
+        a repeated identical call in a later iteration reuses the cached
+        output instead of invoking the tool again."""
+        registry = ToolRegistry()
+        counting = CountingTool()
+        registry.register_instance(counting)
+        orch = Orchestrator(tool_registry=registry)
+
+        plan = [
+            PlanStep(
+                index=0,
+                description="Compute",
+                tool_name="counting_tool",
+                tool_parameters={"value": 3},
+            )
+        ]
+
+        first = AgentState()
+        first.plan = list(plan)
+        first = await orch.execute_plan(first)
+        assert counting.call_count == 1
+
+        second = AgentState()
+        second.plan = list(plan)
+        second = await orch.execute_plan(second)
+
+        assert counting.call_count == 1
+        assert second.results[0]["reused_output_of"] == 0
+
 
 # ═══════════════════════════════════════════════════════════════════
 # 6. Multi-step execution using previous observations
