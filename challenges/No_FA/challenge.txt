@@ -1,0 +1,19 @@
+Title:
+No FA
+
+Category:
+Web exploitation
+
+Description:
+Seems like some data has been leaked! Can you get the flag?
+
+You can get started http://foggy-cliff.picoctf.net:54450/
+ to find the flag!
+
+The application code can be found https://challenge-files.picoctf.net/c_foggy_cliff/9bf05fa33a4486d06b548daf776842ccbcf9914c5f65b32e7d7e8a36e3b64d32/app.py
+.
+
+The leaked data can be found https://challenge-files.picoctf.net/c_foggy_cliff/9bf05fa33a4486d06b548daf776842ccbcf9914c5f65b32e7d7e8a36e3b64d32/users.db
+
+Hint :
+What happens when there's no salt?
