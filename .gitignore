@@ -62,3 +62,8 @@ Thumbs.db
 
 .agents/
 skills-lock.json
+
+analysis/
+web/
+challenges/Cookie_Monster_Secret_Recipe/
+challenges/Egg_V3/
